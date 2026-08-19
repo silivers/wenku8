@@ -47,6 +47,12 @@
         退化为 livelock。小 busy_timeout 让冲突快速失败，交给我方
         `_run_with_lock_retry`（退避封顶 0.5s）兜底。
 
+7. **页面编码实际是 GB18030 而非纯 GBK**（2026-08-19 实测）：wenku8 正文页
+   含 GB18030 四字节扩展字符，Python `gbk` codec 解码会抛
+   `UnicodeDecodeError`（如 `can't decode byte 0xfe`），而 `gb18030` 是超集
+   可完全解出。`safe_decode()` 已做 GB 系→`gb18030` 兜底链——解码失败**勿直接
+   回退 utf-8**（会产生乱码并触发 MojibakeDetector 误报"编码损坏"）。
+
 ## 工程约定（用户偏好）
 - 极简风格：砍非核心特性（如曾移除 Markdown/PDF/TXT 导出、robots 合规）。
 - 先提案 → 再复盘砍过度设计，是固定两轮工作流。

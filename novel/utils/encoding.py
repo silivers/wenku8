@@ -63,9 +63,29 @@ def detect_encoding(
 
 
 def safe_decode(raw_body: bytes, encoding: str) -> tuple[str, str]:
-    """安全解码字节流。返回 (解码文本, 实际使用的编码)。"""
-    try:
-        return raw_body.decode(encoding), encoding
-    except (UnicodeDecodeError, LookupError):
-        text = raw_body.decode("utf-8", errors="replace")
-        return text, "utf-8"
+    """安全解码字节流。返回 (解码文本, 实际使用的编码)。
+
+    GB 系列（gbk/gb2312）解码失败时自动升级到 gb18030 超集：wenku8 等站点
+    页面常含 GB18030 四字节扩展字符，Python 的 gbk codec 会抛
+    UnicodeDecodeError（实测 byte 0xfe 非法序列），而 gb18030 完全兼容 GBK；
+    仅当 gb18030 也失败才回退 utf-8（replace 保底，避免裸抛）。
+    """
+    candidates: list[str] = [encoding]
+    if encoding.lower() in _GB_FAMILY:
+        candidates.append("gb18030")
+    candidates.append("utf-8")
+
+    seen: set[str] = set()
+    for enc in candidates:
+        if enc in seen:
+            continue
+        seen.add(enc)
+        try:
+            return raw_body.decode(enc), enc
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw_body.decode("utf-8", errors="replace"), "utf-8"
+
+
+# GB 系编码：解码失败时用 gb18030（GBK/GB2312 超集）兜底
+_GB_FAMILY = ("gbk", "gb2312", "cp936")
