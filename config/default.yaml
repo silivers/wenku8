@@ -2,8 +2,21 @@
 # 复制到项目根目录或用 --config 指定路径
 
 engine:
-  max_concurrency: 5
-  default_rate_limit: 3.0
+  # 正文章节并发（每 worker 内 asyncio.Semaphore）
+  max_concurrency: 8
+
+crawl:
+  # 全站正文爬取（crawl-all）默认值
+  workers: 8            # 线程数（每 worker 独立限速预算 ≈ N× 吞吐）
+  shard: true           # 分块领取：500 本一组，块内单本粒度、整空白块判末尾
+  rate_limit: 1.0       # 正文请求间隔（秒）——wenku8 站点限速，勿随意调小
+
+images:
+  # 图片独立爬取（images crawl）默认值
+  workers: 8            # 线程数
+  concurrency: 8        # 单本小说内图片并发下载数
+  interval: 1.0         # 图片请求间隔（秒），走 CDN 可放宽
+  max_rounds: 5        # 单张图片最大尝试轮数，超过置 skipped（死链兜底）
 
 http:
   timeout_connect: 10
@@ -22,7 +35,7 @@ middleware:
     - user_agent:
         rotate: true
     - rate_limit:
-        interval: 3.0
+        interval: 1.0
         jitter: 0.3
   response:
     - encoding:

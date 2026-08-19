@@ -1,5 +1,39 @@
 # 项目长期记忆（MEMORY.md）
 
+## 工程状态（2026-08-19）
+- **v3.2 已精简**：只支持全站爬取（`crawl` 单本命令与 `tasks` 命令组已删；
+  任务状态机 TaskManager/crawl_states 读写已删，续爬只靠 `site_meta.last_novel_id`）。
+- **续爬完整性（方案 A 已落地）**：`crawl_site`/worker 池收尾前重扫缺章书
+  （章节差集幂等），仍失败则续爬起点回退到最小失败书号-1——「爬过但没爬完」
+  的书不会被计入进度后漏掉。
+- **配置全集中 `config/default.yaml`**：`crawl:`（workers=4/shard=true/rate_limit=5.0）
+  与 `images:`（workers=4/concurrency=4/interval=1.0/max_rounds=10）段；
+  CLI 无散落默认参数（`crawl-all` 仅剩 --max-novels/--start-id/--auto-export/凭据，
+  `images crawl` 无参数）。改线程/限速一律改 yaml，不用命令行。
+- **文档已归档 docs/**：根目录只有精简 README.md（入口 + 索引）。权威文档
+  `docs/IMAGE_CRAWL_DESIGN.md`（图片）、`docs/MULTITHREAD_DESIGN.md`（多线程）、
+  `docs/USAGE.md`（命令/FAQ）、`docs/TECHNICAL_DESIGN.md`（架构，带偏差校订）。
+- **tests/ 已按用户要求移除**：验证靠 py_compile + 一次性临时脚本（跑完即删），
+  不落仓库。用户明确不要测试代码。
+
+## 图片独立爬取架构（v3.1，已实现 2026-08-19，权威文档 IMAGE_CRAWL_DESIGN.md）
+
+- **两阶段解耦**：`crawl`/`crawl-all` 只爬正文 + `save_images()` 登记图片
+  （images 表 pending，HTML 保留远程 URL）；`images crawl <site>` 轮询下载
+  （失败图 attempt_count+1 下一轮重试，直到全部成功）。EPUB 导出器零改动。
+- **images 表**（004 迁移，替代 resources）：`UNIQUE(novel_id, remote_url)` 幂等；
+  `status`: pending → downloaded/failed → (attempt≥max_rounds) skipped；
+  `chapter_site_id` 存**站点章节号**（落盘目录与回写定位用）。
+- **回写按 novel_id 全量 REPLACE**（`rewrite_chapter_image_url(novel_id, remote_url, local_url)`，
+  不带章节条件）：同 URL 跨章只登记一行，按章回写会漏；全量 REPLACE 幂等。
+- **book_status**（novels 新列）：active/takedown/deleted；下架在
+  `is_takedown()` 命中处写入 takedown，图片轮询查询侧过滤，图片行保留可续补。
+- **存量迁移策略**：不信任 resources（chapter_id 恒 NULL），全部按 pending 重下。
+- **M6 已修**：`filter_existing_chapters`/`chapter_exists` 加 novel_id 限定
+  （wenku8 章节 ID 各书独立，多书爬取必撞号）。
+- 计数用 `count_pending_images(site, site_novel_id)`（按站内书号，CLI 提示用）；
+  迁移测试 `tests/test_image_crawl.py` 含老库(001-003)→004 升级验证。
+
 ## wenku8 适配器关键坑（非显而易见，务必遵守）
 
 1. **章节目录路径按 ID 分桶**：真实路径是 `/novel/{id//1000}/{id}/index.htm`，

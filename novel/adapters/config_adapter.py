@@ -48,7 +48,7 @@ class ConfigAdapter(BaseAdapter):
         return self._config.get("encoding", "utf-8")
 
     def get_rate_limit(self) -> float:
-        return self._config.get("rate_limit", 3.0)
+        return self._config.get("rate_limit", 1.0)
 
     async def search(self, keyword: str, page: int = 1) -> tuple[list[NovelInfo], bool]:
         search_cfg = self._config.get("search")

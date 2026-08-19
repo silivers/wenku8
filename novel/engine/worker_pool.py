@@ -51,8 +51,7 @@ class CrawlWorkerPool:
         db_path:      数据库文件路径（所有 worker 共享同一 WAL 文件）
         workers:      worker 线程数（>=2 才真正多线程；传入 1 时 CLI 直接走单线程路径）
         username/password: 登录凭据（每个 worker 线程内各自登录）
-        rate_limit:   插图下载限速（None 时用 config 默认 / 站点声明）
-        image_concurrency / max_concurrency / max_retries: 每 worker 内并发参数
+        max_concurrency / max_retries: 每 worker 内并发参数
         mode:         "discover"（默认，coordinator 发现 + worker 消费管线）
                       "shard"（分块领取：块内单本粒度 work-stealing，整空白块判定末尾）
     """
@@ -66,8 +65,6 @@ class CrawlWorkerPool:
         workers: int = 2,
         username: str | None = None,
         password: str | None = None,
-        rate_limit: float | None = None,
-        image_concurrency: int = 4,
         max_concurrency: int = 8,
         max_retries: int | None = None,
         mode: str = "discover",
@@ -77,8 +74,6 @@ class CrawlWorkerPool:
         self.db_path = db_path
         self.workers = max(1, int(workers))
         self.creds = (username, password)
-        self.rate_limit = rate_limit
-        self.image_concurrency = image_concurrency
         self.max_concurrency = max_concurrency
         self.max_retries = max_retries
         self.mode = mode
@@ -91,6 +86,8 @@ class CrawlWorkerPool:
         self._lock = threading.Lock()
         self._stats = {"novels": 0, "ok": 0, "fail": 0, "chapters": 0}
         self._truncated = False
+        # 缺章/整本失败的书号（方案 A）：收尾前由 _finalize 重扫补缺
+        self._incomplete: set[str] = set()
 
     # ------------------------------------------------------------------
     # 入口
@@ -117,7 +114,47 @@ class CrawlWorkerPool:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._join_all)
 
+        # 方案 A：重扫缺章书并修正 last_novel_id（防缺章书被计入进度后不再重扫）
+        await self._finalize()
+
         return dict(self._stats)
+
+    async def _finalize(self) -> None:
+        """收尾：重扫缺章书（crawl_novel 章节差集幂等，只补缺章）。
+
+        重扫后仍失败的书：把续爬起点回退到「最小失败书号 - 1」——下次
+        `crawl-all` 从该书续爬会重新经过它（网络恢复后自动补上），防止
+        「爬过但没爬完」的书被计入 last_novel_id 后缺章永久丢失。
+        """
+        if not self._incomplete:
+            return
+        with self._lock:
+            pending = sorted(self._incomplete, key=int)
+        logger.warning(
+            f"[{self.site}] {len(pending)} 本书缺章/失败，收尾前重扫补缺: {pending}"
+        )
+        engine, storage, http_client, adapter = await self._build_engine()
+        still: list[str] = []
+        try:
+            for sid in pending:
+                try:
+                    r = await engine.crawl_novel(sid)
+                    if r.failed_chapters:
+                        still.append(sid)
+                except Exception as e:  # noqa: BLE001
+                    logger.error(f"重扫仍失败 [{sid}]: {e}")
+                    still.append(sid)
+            if still:
+                min_failed = min(int(s) for s in still)
+                current = await storage.get_last_novel_id(self.site)
+                corrected = min(current, min_failed - 1)
+                await storage.set_last_novel_id(self.site, corrected)
+                logger.warning(
+                    f"[{self.site}] {len(still)} 本书重扫后仍缺章，"
+                    f"续爬起点回退到 {corrected}: {still}"
+                )
+        finally:
+            await self._safe_close(engine, storage, http_client, adapter)
 
     # ------------------------------------------------------------------
     # 每 worker 私有引擎构建（必须在 worker 自己的事件循环内调用）
@@ -159,10 +196,6 @@ class CrawlWorkerPool:
         await storage.init()
 
         pipelines = _build_pipelines(self.config)
-        site_rate = adapter.get_rate_limit()
-        engine_rate = self.rate_limit if self.rate_limit is not None else max(
-            self.config.engine.default_rate_limit, site_rate
-        )
         engine = CrawlerEngine(
             adapter=adapter,
             storage=storage,
@@ -171,9 +204,8 @@ class CrawlWorkerPool:
             response_middlewares=resp_mw,
             pipelines=pipelines,
             max_concurrency=self.max_concurrency,
-            rate_limit=engine_rate,
+            rate_limit=self.config.crawl.rate_limit,
             max_retries=self.max_retries or _get_max_retries(self.config),
-            image_concurrency=self.image_concurrency,
         )
         return engine, storage, http_client, adapter
 
@@ -208,11 +240,14 @@ class CrawlWorkerPool:
                             self._stats["chapters"] += len(result.chapters)
                         else:
                             self._stats["fail"] += 1
+                        if result.failed_chapters:
+                            self._incomplete.add(item)
                 except Exception as e:  # noqa: BLE001
                     logger.error(f"worker 爬取失败 [{item}]: {e}")
                     with self._lock:
                         self._stats["novels"] += 1
                         self._stats["fail"] += 1
+                        self._incomplete.add(item)
                 finally:
                     self.task_q.task_done()
         finally:
@@ -354,6 +389,9 @@ class CrawlWorkerPool:
                         logger.error(f"worker 爬取失败 [{nid}]: {exc}")
                         valid = True
                         result = None
+                        # 书号有效但整本失败：加入待补清单，收尾重扫
+                        with self._lock:
+                            self._incomplete.add(str(nid))
 
                     with self._lock:
                         if valid:
@@ -367,6 +405,8 @@ class CrawlWorkerPool:
                             self._stats["chapters"] += len(result.chapters)
                         else:
                             self._stats["fail"] += 1
+                        if valid and result is not None and result.failed_chapters:
+                            self._incomplete.add(str(nid))
             finally:
                 loop.run_until_complete(
                     self._safe_close(engine, storage, http_client, adapter)

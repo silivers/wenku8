@@ -382,103 +382,6 @@ def search(ctx, site_name, keyword, page):
     run_async(_search())
 
 
-# ---- 爬取 ----
-
-
-@cli.command()
-@click.argument("site_name")
-@click.argument("novel_id", required=False)
-@click.option("--chapters", default=None, help="章节范围 (如 1-10)")
-@click.option("--resume", "resume_task_id", default=None, help="断点续爬的任务 ID")
-@click.option("--delay", "delay", default=None, type=float, help="请求间隔（秒），覆盖默认限速（仅作用于插图下载限速）")
-@click.option("--image-concurrency", "image_concurrency", default=4, type=int, help="章节插图并发下载数")
-@click.option("--username", default=None, help="站点登录账号（wenku8 等需登录站点；也可用环境变量 WENKU8_USERNAME）")
-@click.option("--password", default=None, help="站点登录密码（也可用环境变量 WENKU8_PASSWORD，避免明文出现在命令历史）")
-@click.pass_context
-def crawl(ctx, site_name, novel_id, chapters, resume_task_id, delay, image_concurrency, username, password):
-    """爬取指定小说。可用 --resume <task_id> 断点续爬。需登录站点可加 --username/--password（或环境变量）"""
-    config = ctx.obj["config"]
-
-    if not novel_id and not resume_task_id:
-        click.echo("错误: 必须提供 novel_id，或使用 --resume <task_id> 续爬", err=True)
-        sys.exit(1)
-
-    chapter_range = None
-    if chapters:
-        parts = chapters.split("-")
-        if len(parts) == 2:
-            chapter_range = (int(parts[0]), int(parts[1]))
-        else:
-            chapter_range = (1, int(parts[0]))
-
-    async def _crawl():
-        storage, http_client, registry, req_mw, resp_mw, pipelines = create_engine_from_config(config)
-
-        # 续爬时从任务状态解析真实的 site / novel_id（用独立变量，避免遮蔽外层参数）
-        resolved_site = site_name
-        resolved_novel = novel_id
-
-        try:
-            adapter = registry.get(resolved_site)
-            adapter._http_client = http_client
-
-            # 登录（如站点支持且提供了凭据）：登录态贯穿本次爬取的全部请求
-            await maybe_login(adapter, *resolve_credentials(username, password))
-
-            await storage.init()
-
-            # 续爬：从任务状态解析 novel_id / site
-            if resume_task_id:
-                state = await storage.load_state(resume_task_id)
-                if not state:
-                    click.echo(f"错误: 未找到续爬任务 {resume_task_id}", err=True)
-                    sys.exit(1)
-                resolved_novel = state["novel_id"]
-                if state.get("site"):
-                    resolved_site = state["site"]
-                    # 若与命令行 site 不同，切换适配器
-                    adapter = registry.get(resolved_site)
-                    adapter._http_client = http_client
-
-            from novel.engine.crawler import CrawlerEngine
-
-            engine = CrawlerEngine(
-                adapter=adapter,
-                storage=storage,
-                http_client=http_client,
-                request_middlewares=req_mw,
-                response_middlewares=resp_mw,
-                pipelines=pipelines,
-                max_concurrency=config.engine.max_concurrency,
-                rate_limit=delay if delay is not None else max(
-                    config.engine.default_rate_limit, adapter.get_rate_limit()
-                ),
-                chapter_range=chapter_range,
-                max_retries=_get_max_retries(config),
-                resume_task_id=resume_task_id,
-                image_concurrency=image_concurrency,
-            )
-
-            result = await engine.crawl_novel(resolved_novel)
-
-            click.echo(f"\n爬取完成:")
-            click.echo(f"  小说: {result.novel.title}")
-            click.echo(f"  成功: {len(result.chapters)} 章")
-            click.echo(f"  失败: {len(result.failed_chapters)} 章")
-            click.echo(f"  跳过: {len(result.skipped_chapters)} 章")
-
-            await engine.aclose()
-            await adapter.close()
-            await http_client.close()
-            await storage.close()
-        except Exception as e:
-            logger.error(f"爬取失败: {e}")
-            click.echo(f"错误: {e}", err=True)
-            sys.exit(1)
-
-    run_async(_crawl())
-
-
 # ---- 全站爬取 ----
 
 
@@ -487,25 +390,26 @@ def crawl(ctx, site_name, novel_id, chapters, resume_task_id, delay, image_concu
 @click.option("--max-novels", default=None, type=int, help="最多爬取多少本小说")
 @click.option("--start-id", default=None, type=int, help="起始小说 ID（wenku8 ID 遍历用；不填则自动从已存精确数量+1 续爬）")
 @click.option("--auto-export", is_flag=True, help="爬取完成后自动导出 EPUB")
-@click.option("--delay", "delay", default=None, type=float, help="请求间隔（秒），覆盖默认限速（仅作用于插图下载限速）")
-@click.option("--image-concurrency", "image_concurrency", default=4, type=int, help="章节插图并发下载数")
-@click.option("--workers", default=1, type=int, help="多线程 worker 数（>=2 启用多线程池；默认 1 单线程）。每个 worker 独立引擎实例=独立限速预算，≈N× 吞吐")
-@click.option("--shard", "shard_mode", is_flag=True, help="分块领取（需 --workers>=2）：按 BLOCK_SIZE=500 分块，块内所有 worker 按序号最低空闲书号细粒度领取，整块领完切下一块；整空白块判定末尾并记录总书数")
 @click.option("--username", default=None, help="站点登录账号（wenku8 等需登录站点；也可用环境变量 WENKU8_USERNAME）")
 @click.option("--password", default=None, help="站点登录密码（也可用环境变量 WENKU8_PASSWORD）")
 @click.pass_context
-def crawl_all(ctx, site_name, max_novels, start_id, auto_export, delay, image_concurrency, workers, shard_mode, username, password):
-    """全站爬取：遍历站点所有小说并逐一爬取
+def crawl_all(ctx, site_name, max_novels, start_id, auto_export, username, password):
+    """全站爬取：遍历站点所有小说并逐一爬取（仅正文；插图在 `images crawl` 阶段统一下载）
 
-    wenku8 采用 ID 递增遍历（不设上限）：从起始 ID 到无穷，遇到连续 100 个
-    无效编号即判定到站点末尾。首次爬取从 1 开始；之后自动从上次保存的精确
-    数量 +1 续爬（--start-id 可手动覆盖起点）。--max-novels 限制数量。
+    线程数 / 分块模式 / 正文限速在 config.yaml 的 crawl: 段配置（workers / shard /
+    rate_limit）。wenku8 采用 ID 递增遍历（不设上限）：从起始 ID 到无穷，遇到
+    连续 100 个无效编号即判定到站点末尾。首次爬取从 1 开始；之后自动从上次保存
+    的精确数量 +1 续爬（--start-id 可手动覆盖起点）。--max-novels 限制数量。
 
-    多线程：--workers 2 启用多线程池（每 worker 独立引擎+独立限速预算，≈2× 吞吐）；
-    再加 --shard 进入分块领取模式：外层 500 一本分块，块内按最低空闲书号细粒度并行领取、
-    无尾段空等。--workers 1 退化为单线程。
+    多线程：config.crawl.workers（默认 4）>=2 时启用多线程池（每 worker 独立引擎
+    +独立限速预算，≈N× 吞吐）；config.crawl.shard=true 时按 500 本分块、块内单本
+    粒度细粒度并行领取、整空白块判末尾（默认开启）。
     """
     config = ctx.obj["config"]
+
+    # 线程数 / 分块模式从 config 读取（crawl: workers / shard）
+    workers = config.crawl.workers
+    shard_mode = config.crawl.shard
 
     filter_params = {}
     if start_id is not None:
@@ -522,12 +426,12 @@ def crawl_all(ctx, site_name, max_novels, start_id, auto_export, delay, image_co
         if not probe_adapter.supports_site_wide():
             click.echo(
                 f"错误: 站点 '{site_name}' 的适配器未实现全站遍历（iter_all_novels），"
-                f"无法使用 crawl-all。请改用 crawl 单本爬取。",
+                f"无法使用 crawl-all。",
                 err=True,
             )
             sys.exit(1)
 
-        # 多线程池模式（workers >= 2）：每 worker 独立引擎 = 独立限速预算
+        # 多线程池模式（workers >= 2，默认 4）：每 worker 独立引擎 = 独立限速预算
         if workers >= 2:
             from novel.engine.worker_pool import CrawlWorkerPool
 
@@ -539,8 +443,6 @@ def crawl_all(ctx, site_name, max_novels, start_id, auto_export, delay, image_co
                 workers=workers,
                 username=user,
                 password=pwd,
-                rate_limit=delay,
-                image_concurrency=image_concurrency,
                 max_concurrency=config.engine.max_concurrency,
                 mode="shard" if shard_mode else "discover",
             )
@@ -583,11 +485,8 @@ def crawl_all(ctx, site_name, max_novels, start_id, auto_export, delay, image_co
                 response_middlewares=resp_mw,
                 pipelines=pipelines,
                 max_concurrency=config.engine.max_concurrency,
-                rate_limit=delay if delay is not None else max(
-                    config.engine.default_rate_limit, adapter.get_rate_limit()
-                ),
+                rate_limit=config.crawl.rate_limit,
                 max_retries=_get_max_retries(config),
-                image_concurrency=image_concurrency,
             )
 
             results = await engine.crawl_site(
@@ -604,6 +503,15 @@ def crawl_all(ctx, site_name, max_novels, start_id, auto_export, delay, image_co
             total_skipped = sum(len(r.skipped_chapters) for r in results)
             total_failed = sum(len(r.failed_chapters) for r in results)
             click.echo(f"  章节成功: {total_chapters}, 跳过: {total_skipped}, 失败: {total_failed}")
+
+            # 提示图片待下载（正文与图片已解耦）
+            img_stats = await storage.get_image_stats(site_name)
+            pending = sum(
+                img_stats["status_counts"].get(s, 0)
+                for s in ("pending", "failed")
+            )
+            if pending:
+                click.echo(f"  待下载图片: {pending} 张（运行 `novel images crawl {site_name}` 补齐）")
 
             # 自动导出
             if auto_export and results:
@@ -670,6 +578,111 @@ async def _export_site(config: "AppConfig", site_name: str) -> None:
         await storage.close()
 
 
+# ---- 图片爬取（独立阶段，与正文解耦）----
+
+
+@cli.group()
+def images():
+    """图片爬取管理（与正文爬取解耦的独立阶段）"""
+
+
+@images.command("crawl")
+@click.argument("site_name")
+@click.pass_context
+def images_crawl(ctx, site_name):
+    """图片轮询爬取：一轮全站遍历，失败图片下一轮重试，直到全部成功。
+
+    线程数 / 并发 / 间隔 / 最大轮数在 config.yaml 的 images: 段配置
+    （workers / concurrency / interval / max_rounds）。workers>=2 时每轮由
+    多线程池并行消费待下载书目（独立限速预算 ≈ N× 吞吐）；下架（takedown）
+    书目的图片自动跳过。
+    """
+    config = ctx.obj["config"]
+    workers = config.images.workers
+    image_concurrency = config.images.concurrency
+    delay = config.images.interval
+    max_rounds = config.images.max_rounds
+
+    async def _crawl():
+        storage, http_client, _, _, _, _ = create_engine_from_config(config)
+        await storage.init()
+        try:
+            from novel.engine.image_crawler import ImageCrawler, ImageWorkerPool
+
+            if workers >= 2:
+                pool = ImageWorkerPool(
+                    config=config,
+                    site=site_name,
+                    db_path=config.storage.sqlite.path,
+                    workers=workers,
+                    image_concurrency=image_concurrency,
+                    interval=delay,
+                    max_rounds=max_rounds,
+                )
+                report = await pool.arun()
+            else:
+                crawler = ImageCrawler(
+                    storage=storage,
+                    http_client=http_client,
+                    image_concurrency=image_concurrency,
+                    interval=delay,
+                    max_rounds=max_rounds,
+                )
+                report = await crawler.run(site_name)
+
+            click.echo(f"\n图片爬取完成:")
+            click.echo(f"  轮数:     {report.rounds}")
+            click.echo(f"  书目:     {report.novels}")
+            click.echo(f"  成功:     {report.images_ok} 张")
+            click.echo(f"  失败:     {report.images_failed} 张")
+            click.echo(f"  跳过:     {report.skipped} 张（重试耗尽）")
+            click.echo(f"  剩余:     {report.remaining} 张")
+            if report.remaining:
+                click.echo("提示: 仍有图片未下载成功，请检查 last_error 或重跑本命令")
+        except Exception as e:
+            logger.error(f"图片爬取失败: {e}")
+            click.echo(f"错误: {e}", err=True)
+            sys.exit(1)
+        finally:
+            await http_client.close()
+            await storage.close()
+
+    run_async(_crawl())
+
+
+@images.command("status")
+@click.argument("site_name")
+@click.pass_context
+def images_status(ctx, site_name):
+    """查看图片爬取状态：各状态计数、当前轮次、待下载书目数"""
+    config = ctx.obj["config"]
+
+    async def _status():
+        storage, _, _, _, _, _ = create_engine_from_config(config)
+        await storage.init()
+        try:
+            stats = await storage.get_image_stats(site_name)
+            counts = stats["status_counts"]
+            pending = counts.get("pending", 0)
+            failed = counts.get("failed", 0)
+            downloaded = counts.get("downloaded", 0)
+            skipped = counts.get("skipped", 0)
+
+            if ctx.obj["json"]:
+                click.echo(json.dumps(stats, ensure_ascii=False, indent=2))
+            else:
+                click.echo(f"图片状态 (站点 {site_name}):")
+                click.echo(f"  当前轮次:   {stats['current_round']}")
+                click.echo(f"  待下载:     {pending + failed} 张 (pending {pending} / failed {failed})")
+                click.echo(f"  已下载:     {downloaded} 张")
+                click.echo(f"  已跳过:     {skipped} 张")
+                click.echo(f"  待下载书目: {stats['pending_novels']} 本")
+        finally:
+            await storage.close()
+
+    run_async(_status())
+
+
 # ---- 增量更新 ----
 
 
@@ -725,9 +738,7 @@ def update(ctx, site_name, username, password):
                         response_middlewares=resp_mw,
                         pipelines=pipelines,
                         max_concurrency=config.engine.max_concurrency,
-                        rate_limit=max(
-                            config.engine.default_rate_limit, adapter.get_rate_limit()
-                        ),
+                        rate_limit=config.crawl.rate_limit,
                         max_retries=_get_max_retries(config),
                     )
                     await engine.crawl_novel(site_novel_id)
@@ -772,6 +783,25 @@ def export(ctx, novel_id, output_path):
         )
 
         try:
+            # 警告：图片未全部就绪（正文与图片解耦后，导出可能缺图）
+            from novel.storage.sqlite_backend import SQLiteBackend
+
+            novel_row = None
+            novels = await storage.get_novel_list()
+            for n in novels:
+                if n["id"] == novel_id or n["site_novel_id"] == novel_id:
+                    novel_row = n
+                    break
+            if novel_row:
+                pending = await storage.count_pending_images(
+                    novel_row["site"], novel_row["site_novel_id"]
+                )
+                if pending:
+                    click.echo(
+                        f"警告: 该小说还有 {pending} 张图片未下载，"
+                        f"EPUB 可能缺图。可先运行 `novel images crawl {novel_row['site']}`"
+                    )
+
             path = await exporter.export(novel_id, output_path)
             click.echo(f"EPUB 已导出: {path}")
         except Exception as e:
@@ -901,148 +931,6 @@ def delete(ctx, novel_id):
     run_async(_delete())
 
 
-# ---- 任务管理 ----
-
-
-@cli.group()
-def tasks():
-    """任务管理"""
-
-
-@tasks.command("list")
-@click.pass_context
-def tasks_list(ctx):
-    """列出任务"""
-    config = ctx.obj["config"]
-
-    async def _list():
-        storage, _, _, _, _, _ = create_engine_from_config(config)
-        await storage.init()
-        task_list = await storage.list_tasks()
-
-        if not task_list:
-            click.echo("暂无任务")
-            return
-
-        click.echo(f"共 {len(task_list)} 个任务:")
-        click.echo("-" * 80)
-        for t in task_list:
-            click.echo(
-                f"  [{t['task_id'][:8]}] {t['site']}/{t['novel_id']} "
-                f"- {t['status']} ({t.get('crawled_chapters', 0)}/"
-                f"{t.get('total_chapters', 0)})"
-            )
-
-        await storage.close()
-
-    run_async(_list())
-
-
-@tasks.command("status")
-@click.argument("task_id")
-@click.pass_context
-def tasks_status(ctx, task_id):
-    """查看任务状态"""
-    config = ctx.obj["config"]
-
-    async def _status():
-        storage, _, _, _, _, _ = create_engine_from_config(config)
-        await storage.init()
-        state = await storage.load_state(task_id)
-
-        if not state:
-            click.echo(f"未找到任务: {task_id}")
-            sys.exit(1)
-
-        click.echo(f"任务 ID:    {state['task_id']}")
-        click.echo(f"站点:       {state['site']}")
-        click.echo(f"小说 ID:    {state['novel_id']}")
-        click.echo(f"状态:       {state['status']}")
-        click.echo(f"进度:       {state.get('crawled_chapters', 0)}/{state.get('total_chapters', 0)}")
-        if state.get("error_message"):
-            click.echo(f"错误:       {state['error_message']}")
-
-        await storage.close()
-
-    run_async(_status())
-
-
-@tasks.command("pause")
-@click.argument("task_id")
-@click.pass_context
-def tasks_pause(ctx, task_id):
-    """暂停任务（运行中的爬取会在下一章节边界停止）"""
-    config = ctx.obj["config"]
-
-    async def _pause():
-        storage, _, _, _, _, _ = create_engine_from_config(config)
-        await storage.init()
-        from novel.engine.state import TaskManager
-
-        manager = TaskManager(storage)
-        try:
-            await manager.pause_task(task_id)
-            click.echo(f"已暂停任务: {task_id}")
-        except Exception as e:
-            click.echo(f"暂停失败: {e}", err=True)
-            sys.exit(1)
-        finally:
-            await storage.close()
-
-    run_async(_pause())
-
-
-@tasks.command("resume")
-@click.argument("task_id")
-@click.pass_context
-def tasks_resume(ctx, task_id):
-    """恢复任务（状态置为 running，随后用 `crawl --resume <task_id>` 续爬）"""
-    config = ctx.obj["config"]
-
-    async def _resume():
-        storage, _, _, _, _, _ = create_engine_from_config(config)
-        await storage.init()
-        from novel.engine.state import TaskManager
-
-        manager = TaskManager(storage)
-        try:
-            state = await manager.resume_task(task_id)
-            click.echo(f"已恢复任务: {task_id} (status={state['status']})")
-            click.echo(f"续爬命令: novel crawl {state['site']} {state['novel_id']} --resume {task_id}")
-        except Exception as e:
-            click.echo(f"恢复失败: {e}", err=True)
-            sys.exit(1)
-        finally:
-            await storage.close()
-
-    run_async(_resume())
-
-
-@tasks.command("delete")
-@click.argument("task_id")
-@click.confirmation_option(prompt="确定删除该任务记录？")
-@click.pass_context
-def tasks_delete(ctx, task_id):
-    """删除任务记录"""
-    config = ctx.obj["config"]
-
-    async def _delete():
-        storage, _, _, _, _, _ = create_engine_from_config(config)
-        await storage.init()
-        from novel.engine.state import TaskManager
-
-        manager = TaskManager(storage)
-        try:
-            await manager.delete_task(task_id)
-            click.echo(f"已删除任务: {task_id}")
-        except Exception as e:
-            click.echo(f"删除失败: {e}", err=True)
-            sys.exit(1)
-        finally:
-            await storage.close()
-
-    run_async(_delete())
-
 
 # ---- 配置 ----
 
@@ -1079,8 +967,10 @@ def config_show(ctx):
 
     click.echo(f"存储后端:   {config.storage.backend}")
     click.echo(f"数据库路径: {config.storage.sqlite.path}")
-    click.echo(f"最大并发:   {config.engine.max_concurrency}")
-    click.echo(f"默认限速:   {config.engine.default_rate_limit}s")
+    click.echo(f"章节并发:   {config.engine.max_concurrency}")
+    click.echo(f"爬取线程:   {config.crawl.workers} (shard={config.crawl.shard})")
+    click.echo(f"正文限速:   {config.crawl.rate_limit}s")
+    click.echo(f"图片线程:   {config.images.workers} (并发 {config.images.concurrency}, 间隔 {config.images.interval}s, 轮数 {config.images.max_rounds})")
     click.echo(f"输出目录:   {config.export.output_dir}")
     click.echo(f"日志级别:   {config.logging.level}")
 

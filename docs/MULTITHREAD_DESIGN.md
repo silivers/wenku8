@@ -3,7 +3,9 @@
 > 状态：**已实现**（2026-08-19）。落地代码见 `novel/engine/worker_pool.py`、
 > `novel/storage/sqlite_backend.py`（`_INIT_LOCK` + `_commit_retry`）、
 > `novel/adapters/registry.py`（`build()`）、`novel/engine/crawler.py`
-> （`write_last_id`）、CLI `crawl-all --workers/--shard`。
+> （`write_last_id`）。**v3.2 更新**：`--workers/--shard` CLI 参数已移除，
+> 线程数与分块模式改由 `config/default.yaml` 的 `crawl:` 段（`workers`/`shard`）控制，
+> 默认 4 线程 + 分块开启。
 > 验证：6 线程 WAL 并发 2400 章 0 锁；真实站点 `--workers 2 --shard` 并发落地
 > 段1《文学少女》与段2《BLACK LAGOON》两本无锁库。
 

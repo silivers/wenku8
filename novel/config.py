@@ -12,8 +12,28 @@ import yaml
 
 @dataclass
 class EngineConfig:
-    max_concurrency: int = 5
-    default_rate_limit: float = 3.0
+    """正文章节并发（每 worker 内 asyncio.Semaphore）。"""
+
+    max_concurrency: int = 8
+
+
+@dataclass
+class CrawlConfig:
+    """全站正文爬取（crawl-all）。"""
+
+    workers: int = 4          # 默认线程数（每 worker 独立限速预算 ≈ N× 吞吐）
+    shard: bool = True        # 默认分块领取（500 本一组，块内单本粒度）
+    rate_limit: float = 5.0   # 正文请求间隔（秒），wenku8 站点限速
+
+
+@dataclass
+class ImagesConfig:
+    """图片独立爬取（images crawl）。"""
+
+    workers: int = 4          # 默认线程数
+    concurrency: int = 4      # 单本小说内图片并发下载数
+    interval: float = 1.0     # 图片请求间隔（秒），走 CDN 可放宽
+    max_rounds: int = 10      # 单张图片最大尝试轮数，超过置 skipped（死链兜底）
 
 
 @dataclass
@@ -65,6 +85,8 @@ class LoggingConfig:
 @dataclass
 class AppConfig:
     engine: EngineConfig = field(default_factory=EngineConfig)
+    crawl: CrawlConfig = field(default_factory=CrawlConfig)
+    images: ImagesConfig = field(default_factory=ImagesConfig)
     http: HTTPConfig = field(default_factory=HTTPConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     export: ExportConfig = field(default_factory=ExportConfig)

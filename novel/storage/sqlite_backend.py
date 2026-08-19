@@ -53,7 +53,7 @@ class SQLiteBackend(StorageBackend):
             # 在多线程 writer 下退化为类 livelock（所有连接都在等待，无人能写）。
             # 小 busy_timeout 让冲突【快速失败】，交给 _run_with_lock_retry 的
             # Python 侧指数退避重试（封顶 0.5s）兜底，整体吞吐与延迟都更优。
-            # 短事务（save_chapter/save_image 每章/每图 commit）已把写锁持有降到毫秒级，
+            # 短事务（save_chapter/save_images 每章/每批 commit）已把写锁持有降到毫秒级，
             # 200ms 通常足以让另一连接的毫秒事务提交，极少触发应用层重试。
             # connect(timeout=5.0) 作为双保险：sqlite3 层 busy handler 上限 5s。
             await self._conn.execute("PRAGMA journal_mode=WAL")
@@ -328,31 +328,20 @@ class SQLiteBackend(StorageBackend):
         )
         row = await cursor.fetchone()
 
-        # 序列化 images 列表为 JSON
-        images_json = json.dumps(
-            [
-                {
-                    "url": img.url,
-                    "caption": img.caption,
-                    "alt": img.alt,
-                    "index": img.index,
-                }
-                for img in chapter.images
-            ],
-            ensure_ascii=False,
-        ) if chapter.images else "[]"
-
+        # 图片不再随章节落库（004 迁移已 DROP chapters.images 列）：
+        # 插图由 _crawl_chapter 经 save_images 独立登记到 images 表（pending），
+        # 下载成功后由图片爬取阶段回写 HTML。此处只存正文。
         if row:
             internal_id = row["id"]
             await self._exec(
                 """UPDATE chapters SET title=?, content=?, content_format=?,
                    word_count=?, author_note=?, is_crawled=1, crawl_time=?,
-                   content_hash=?, volume=?, chapter_index=?, images=? WHERE id=?""",
+                   content_hash=?, volume=?, chapter_index=? WHERE id=?""",
                 (
                     chapter.title, chapter.content, chapter.content_format,
                     chapter.word_count, chapter.author_note,
                     datetime.now().isoformat(), chapter.content_hash,
-                    volume, chapter_index, images_json, internal_id,
+                    volume, chapter_index, internal_id,
                 ),
             )
         else:
@@ -360,15 +349,14 @@ class SQLiteBackend(StorageBackend):
             await self._exec(
                 """INSERT INTO chapters (id, novel_id, site_chapter_id, title,
                    chapter_index, content, content_format, word_count, author_note,
-                   is_crawled, crawl_time, content_hash, volume, images)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   is_crawled, crawl_time, content_hash, volume)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     internal_id, novel_internal_id, chapter.chapter_id,
                     chapter.title, chapter_index, chapter.content,
                     chapter.content_format, chapter.word_count,
                     chapter.author_note, 1,
                     datetime.now().isoformat(), chapter.content_hash, volume,
-                    images_json,
                 ),
             )
 
@@ -381,28 +369,34 @@ class SQLiteBackend(StorageBackend):
         await self._commit_retry()
         return internal_id
 
-    async def chapter_exists(self, chapter_id: str, site: str) -> bool:
+    async def chapter_exists(self, chapter_id: str, novel_id: str, site: str) -> bool:
         cursor = await self._exec(
             """SELECT 1 FROM chapters c
                JOIN novels n ON c.novel_id = n.id
-               WHERE c.site_chapter_id=? AND n.site=?""",
-            (chapter_id, site),
+               WHERE c.site_chapter_id=? AND c.novel_id=? AND n.site=?""",
+            (chapter_id, novel_id, site),
         )
         row = await cursor.fetchone()
         return row is not None
 
     async def filter_existing_chapters(
-        self, chapter_ids: list[str], site: str
+        self, chapter_ids: list[str], site: str, novel_id: str
     ) -> set[str]:
-        """批量检查已存在的章节（单次 IN 查询，修复 M2 的 N+1 逐条查询）。"""
+        """批量检查已存在的章节（单次 IN 查询，修复 M2 的 N+1 逐条查询）。
+
+        必须限定 novel_id：wenku8 的 site_chapter_id 是各书独立的相对编号
+        （"1"、"2"...），不限定小说会把 B 书的章节误判为 A 书已爬而跳过
+        （多书/全站爬取必然触发）。M6 修复。
+        """
         if not chapter_ids:
             return set()
         placeholders = ",".join("?" * len(chapter_ids))
         cursor = await self._exec(
             f"""SELECT c.site_chapter_id FROM chapters c
                 JOIN novels n ON c.novel_id = n.id
-                WHERE c.site_chapter_id IN ({placeholders}) AND n.site=?""",
-            (*chapter_ids, site),
+                WHERE c.site_chapter_id IN ({placeholders})
+                  AND c.novel_id=? AND n.site=?""",
+            (*chapter_ids, novel_id, site),
         )
         return {row["site_chapter_id"] for row in await cursor.fetchall()}
 
@@ -438,89 +432,175 @@ class SQLiteBackend(StorageBackend):
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
-    # ---- Resource ----
+    # ---- Image（独立图片爬取任务，替代原 resources/save_image）----
+    # 文本爬取阶段只登记 pending（save_images），下载/重试由图片轮询阶段驱动
+    # （mark_image_downloaded / mark_image_failed / skip_exhausted_images）。
+    # 所有写操作保持短事务（每调用一次 commit），沿用 WAL 三铁律。
 
-    async def save_image(
+    async def save_images(
         self,
         novel_internal_id: str,
-        chapter_internal_id: str | None,
+        chapter_site_id: str | None,
         resource_type: str,
-        remote_url: str,
-        local_path: str,
-        caption: str = "",
-        file_hash: str = "",
-        image_order: int = 0,
-    ) -> str:
-        # 去重：同 (小说, 远程 URL, 资源类型) 已存在则跳过重复插入（修复 M3）
+        images: list,
+    ) -> int:
+        """批量登记图片为 pending。UNIQUE(novel_id, remote_url) 保证幂等：
+        断点续爬/重爬时同一张图不会产生重复行。返回本次插入条数。"""
+        if not images:
+            return 0
+        inserted = 0
+        now = datetime.now().isoformat()
+        for img in images:
+            url = getattr(img, "url", "") or ""
+            if not url:
+                continue
+            cursor = await self._exec(
+                """INSERT OR IGNORE INTO images
+                   (novel_id, chapter_site_id, resource_type, remote_url,
+                    image_order, status, created_at, updated_at)
+                   VALUES (?,?,?,?,?,'pending',?,?)""",
+                (
+                    novel_internal_id, chapter_site_id, resource_type,
+                    url, getattr(img, "index", 0) or 0, now, now,
+                ),
+            )
+            if cursor.rowcount and cursor.rowcount > 0:
+                inserted += cursor.rowcount
+        # 每章一次提交（短事务）：与 save_chapter 同理，多线程 WAL 单写者下
+        # 写锁持有降到毫秒级，避免饿死其它 worker。
+        await self._commit_retry()
+        return inserted
+
+    async def get_novels_with_pending_images(
+        self, site: str, max_attempts: int = 10, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        """返回有待下载图片（pending/failed 且 attempt<max_attempts、
+        book_status='active'）的小说。轮询循环每一轮用它取候选书目。"""
+        sql = (
+            """SELECT n.id, n.title, COUNT(*) AS pending_count
+               FROM images i
+               JOIN novels n ON i.novel_id = n.id
+               WHERE n.site=? AND n.book_status='active'
+                 AND i.status IN ('pending','failed')
+                 AND i.attempt_count < ?
+               GROUP BY n.id, n.title
+               ORDER BY n.id"""
+        )
+        params: list[Any] = [site, max_attempts]
+        if limit:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        cursor = await self._exec(sql, tuple(params))
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_pending_images(self, novel_internal_id: str) -> list[dict[str, Any]]:
         cursor = await self._exec(
-            """SELECT id FROM resources
-               WHERE novel_id=? AND remote_url=? AND resource_type=?""",
-            (novel_internal_id, remote_url, resource_type),
+            """SELECT * FROM images
+               WHERE novel_id=? AND status IN ('pending','failed')
+               ORDER BY chapter_site_id, image_order, id""",
+            (novel_internal_id,),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def count_pending_images(self, site: str, site_novel_id: str) -> int:
+        cursor = await self._exec(
+            """SELECT COUNT(*) AS c FROM images i
+               JOIN novels n ON i.novel_id=n.id
+               WHERE n.site=? AND n.site_novel_id=?
+                 AND i.status IN ('pending','failed')""",
+            (site, site_novel_id),
         )
         row = await cursor.fetchone()
-        if row:
-            return row["id"]
+        return int(row["c"]) if row else 0
 
-        internal_id = str(uuid.uuid4())
+    async def mark_image_downloaded(
+        self, image_id: int, local_path: str, file_hash: str
+    ) -> None:
         await self._exec(
-            """INSERT INTO resources (id, novel_id, chapter_id, resource_type,
-               remote_url, local_path, caption, file_hash, image_order)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (
-                internal_id, novel_internal_id, chapter_internal_id,
-                resource_type, remote_url, local_path, caption,
-                file_hash, image_order,
-            ),
+            """UPDATE images SET status='downloaded', local_path=?, file_hash=?,
+               last_error=NULL, updated_at=? WHERE id=?""",
+            (local_path, file_hash, datetime.now().isoformat(), image_id),
         )
-        # 每图提交一次（短事务）：与 save_chapter 同理，避免多线程 WAL 单写者下
-        # 写锁被长事务独占而饿死其它 worker。封面/插图写入后 crawler 另有兜底
-        # commit（无未决事务时为 no-op）。
         await self._commit_retry()
-        return internal_id
 
-    # ---- State ----
-
-    async def save_state(self, task_id: str, state: dict) -> None:
-        failed = state.get("failed_chapters", "[]")
-        if isinstance(failed, list):
-            failed = json.dumps(failed)
-
+    async def mark_image_failed(self, image_id: int, error: str) -> None:
         await self._exec(
-            """INSERT OR REPLACE INTO crawl_states
-               (task_id, novel_id, site, status, total_chapters,
-                crawled_chapters, failed_chapters, last_chapter_id,
-                started_at, updated_at, error_message)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            """UPDATE images SET status='failed', attempt_count=attempt_count+1,
+               last_error=?, last_attempt_at=?, updated_at=? WHERE id=?""",
             (
-                task_id,
-                state.get("novel_id"),
-                state.get("site"),
-                state.get("status"),
-                state.get("total_chapters", 0),
-                state.get("crawled_chapters", 0),
-                failed,
-                state.get("last_chapter_id"),
-                state.get("started_at"),
-                state.get("updated_at"),
-                state.get("error_message"),
+                (error or "")[:500], datetime.now().isoformat(),
+                datetime.now().isoformat(), image_id,
             ),
         )
         await self._commit_retry()
 
-    async def load_state(self, task_id: str) -> dict | None:
+    async def skip_exhausted_images(self, max_rounds: int) -> int:
+        """把 attempt_count>=max_rounds 仍失败的图片置 skipped（死链兜底，
+        保证轮询必然收敛，不因死链死循环）。返回受影响行数。"""
         cursor = await self._exec(
-            "SELECT * FROM crawl_states WHERE task_id=?", (task_id,)
+            """UPDATE images SET status='skipped', updated_at=?
+               WHERE status='failed' AND attempt_count>=?""",
+            (datetime.now().isoformat(), max_rounds),
+        )
+        await self._commit_retry()
+        return cursor.rowcount if cursor.rowcount else 0
+
+    async def rewrite_chapter_image_url(
+        self, novel_id: str, remote_url: str, local_url: str
+    ) -> None:
+        """把章节 HTML 中的远程图片 URL 替换为本地相对路径。
+
+        按 novel_id 全量 REPLACE（不带 site_chapter_id 条件）：同一远程 URL
+        跨章出现时一并覆盖；对已替换过的章节是 no-op（URL 已不存在），幂等。
+        """
+        await self._exec(
+            """UPDATE chapters SET content = replace(content, ?, ?)
+               WHERE novel_id=? AND content IS NOT NULL""",
+            (remote_url, local_url, novel_id),
+        )
+        await self._commit_retry()
+
+    async def set_novel_status(self, novel_internal_id: str, status: str) -> None:
+        await self._exec(
+            "UPDATE novels SET book_status=? WHERE id=?",
+            (status, novel_internal_id),
+        )
+        await self._commit_retry()
+
+    async def set_novel_cover(
+        self, novel_internal_id: str, local_path: str
+    ) -> None:
+        await self._exec(
+            "UPDATE novels SET cover_local=? WHERE id=?",
+            (local_path, novel_internal_id),
+        )
+        await self._commit_retry()
+
+    async def get_image_stats(self, site: str) -> dict[str, Any]:
+        """图片爬取统计：各 status 计数、当前轮次、待下载书目数。"""
+        cursor = await self._exec(
+            """SELECT i.status, COUNT(*) AS c
+               FROM images i JOIN novels n ON i.novel_id=n.id
+               WHERE n.site=?
+               GROUP BY i.status""",
+            (site,),
+        )
+        status_counts: dict[str, int] = {
+            row["status"]: int(row["c"]) for row in await cursor.fetchall()
+        }
+        cursor = await self._exec(
+            "SELECT COALESCE(MAX(attempt_count),0) AS m FROM images"
         )
         row = await cursor.fetchone()
-        if not row:
-            return None
-        result = dict(row)
-        if result.get("failed_chapters"):
-            try:
-                result["failed_chapters"] = json.loads(result["failed_chapters"])
-            except (json.JSONDecodeError, TypeError):
-                result["failed_chapters"] = []
-        return result
+        round_no = int(row["m"]) if row else 0
+        pending_novels = await self.get_novels_with_pending_images(
+            site, max_attempts=1 << 30
+        )
+        return {
+            "status_counts": status_counts,
+            "current_round": round_no,
+            "pending_novels": len(pending_novels),
+        }
 
     # ---- Site meta（全站遍历精确数量）----
 
@@ -544,25 +624,6 @@ class SQLiteBackend(StorageBackend):
         )
         await self._commit_retry()
 
-    async def list_tasks(self, site: str | None = None) -> list[dict[str, Any]]:
-        if site:
-            cursor = await self._exec(
-                "SELECT * FROM crawl_states WHERE site=? ORDER BY updated_at DESC",
-                (site,),
-            )
-        else:
-            cursor = await self._exec(
-                "SELECT * FROM crawl_states ORDER BY updated_at DESC"
-            )
-        rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
-
-    async def delete_task(self, task_id: str) -> None:
-        await self._exec(
-            "DELETE FROM crawl_states WHERE task_id=?", (task_id,)
-        )
-        await self._commit_retry()
-
     # ---- Stats ----
 
     async def get_stats(self) -> dict[str, Any]:
@@ -583,11 +644,22 @@ class SQLiteBackend(StorageBackend):
         )
         sites = {row["site"]: row["count"] for row in await cursor.fetchall()}
 
+        cursor = await self._exec(
+            "SELECT status, COUNT(*) as c FROM images GROUP BY status"
+        )
+        image_status = {
+            row["status"]: int(row["c"]) for row in await cursor.fetchall()
+        }
+        cursor = await self._exec("SELECT COUNT(*) as count FROM images")
+        image_total = (await cursor.fetchone())["count"]
+
         return {
             "novels": novel_count,
             "chapters": chapter_count,
             "total_words": total_words,
             "sites": sites,
+            "images": image_total,
+            "image_status": image_status,
         }
 
     # ---- Helpers ----

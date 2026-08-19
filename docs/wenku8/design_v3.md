@@ -8,7 +8,7 @@
 > **📌 落地状态（2026-08-19 校订）**：本方案为设计稿，下述能力已在代码中落地，其余为"已决定不做 / 暂缓"：
 > **已落地**：适配器模式（ConfigAdapter + CodeAdapter）、请求/响应中间件链、数据管道（清洗→归一化→去重→校验）、SQLite 存储（WAL）、EPUB 3.0 导出、wenku8 登录态（`login()` + `sites login`）、章节 URL 分桶（`/novel/{id//1000}/{id}/index.htm`）、下架检测精确化、正文广告过滤、多线程全站爬取（`worker_pool.py` + `crawl-all --workers/--shard`）、全站 ID 递增遍历 + 自动续爬。
 > **已决定不做 / 暂缓**：PostgreSQL 后端（仅 SQLite）、Proxy 中间件与代理池、syosetu 等额外代码适配器（仅 wenku8）、Web UI / REST API、Ruby 注音处理管道、竖排（`writing-mode`）、webhook 报警、Redis/布隆过滤器去重（精确 SHA-256 去重足够）。
-> 设计稿与实现细节差异以 `README.md` / `USAGE.md` / `TECHNICAL_DESIGN.md` / `MULTITHREAD_DESIGN.md` / `WENKU8_LOGIN_REPORT.md` 为准。
+> 设计稿与实现细节差异以 `../README.md` / `../USAGE.md` / `../TECHNICAL_DESIGN.md` / `../MULTITHREAD_DESIGN.md` / `../WENKU8_LOGIN_REPORT.md` 为准。
 
 ---
 

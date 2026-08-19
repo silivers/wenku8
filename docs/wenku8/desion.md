@@ -4,7 +4,7 @@
 **日期**：2026年8月13日  
 **状态**：最终设计稿（不含代码实现）  
 
-> **📜 历史设计稿**：本文是项目最早的设计方案（2026-08-13），许多设想（PostgreSQL/Redis 存储、代理池、Selenium 渲染、Web 管理界面、Docker 部署、Bloom Filter 去重、Webhook 报警）**未在 v3.0+ 实现中落地**——当前实现聚焦轻量：SQLite（WAL）+ 中间件/管道 + asyncio + 多线程 `worker_pool` + wenku8 单站 + EPUB 导出。最新且准确的资料见 `README.md`、`USAGE.md`、`TECHNICAL_DESIGN.md`（实现细节）、`MULTITHREAD_DESIGN.md`（多线程）、`WENKU8_LOGIN_REPORT.md`（登录/分桶/下架/广告修复）。本文保留作设计演进参考。
+> **📜 历史设计稿**：本文是项目最早的设计方案（2026-08-13），许多设想（PostgreSQL/Redis 存储、代理池、Selenium 渲染、Web 管理界面、Docker 部署、Bloom Filter 去重、Webhook 报警）**未在 v3.0+ 实现中落地**——当前实现聚焦轻量：SQLite（WAL）+ 中间件/管道 + asyncio + 多线程 `worker_pool` + wenku8 单站 + EPUB 导出。最新且准确的资料见 `../README.md`、`../USAGE.md`、`../TECHNICAL_DESIGN.md`（实现细节）、`../MULTITHREAD_DESIGN.md`（多线程）、`../IMAGE_CRAWL_DESIGN.md`（图片独立爬取）、`../WENKU8_LOGIN_REPORT.md`（登录/分桶/下架/广告修复）。本文保留作设计演进参考。
 
 ---
 

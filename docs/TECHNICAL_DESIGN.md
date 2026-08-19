@@ -11,8 +11,11 @@
 > - **正文广告过滤**：模块级 `_AD_TEXT_PATTERNS` + `get_chapter_content` 内的 `_strip_ad_text()`。
 > - **多线程全站爬取**：`novel/engine/worker_pool.py`（`CrawlWorkerPool`），`crawl-all --workers N [--shard]`，每 worker 独立引擎实例（含独立 `RateLimitMiddleware` 限速预算）≈ N× 吞吐（见 `MULTITHREAD_DESIGN.md`）。
 > - **全站遍历**：ID 递增、连续 100 个无效编号即止、自动续爬（`--start-id` 覆盖起点），**无** `--class-id` / `--end-id`。
-> - **SQLite 并发写**：WAL + `isolation_level=None`（真 autocommit）+ `PRAGMA busy_timeout=200` + 模块级 `_INIT_LOCK` + 每个写操作（save_chapter/save_image）写完即提交（短事务）+ `_commit_retry()` 退避重试。
-> 正文个别行号/片段为历史快照，可能已偏移；命令与新增能力以 `USAGE.md`、`MULTITHREAD_DESIGN.md`、`WENKU8_LOGIN_REPORT.md` 为准。
+> - **SQLite 并发写**：WAL + `isolation_level=None`（真 autocommit）+ `PRAGMA busy_timeout=200` + 模块级 `_INIT_LOCK` + 每个写操作（save_chapter/save_images）写完即提交（短事务）+ `_commit_retry()` 退避重试。
+> - **图片独立爬取（v3.1）**：正文与图片彻底解耦——`crawl-all` 只爬正文并把图片登记到新 `images` 表（pending），插图/封面由 `images crawl` 轮询下载（失败图下一轮重试直至全部成功，`images.max_rounds` 兜底置 skipped；下架书经 `novels.book_status` 跳过）。`resources` 表与 `chapters.images` 列已在 004 迁移中退役。图片链路的权威说明见 `IMAGE_CRAWL_DESIGN.md`（已实现）；本文 §7 / §9 的 resources/save_image 描述为历史快照。
+> - **精简（v3.2）**：移除单本爬取（`crawl` 命令与 `--resume`/`--chapters`）、任务状态机（`tasks` 命令、`crawl_states` 读写、`engine/state.py` 已删）；限速 / 线程 / 并发等默认值全部集中到 `config/default.yaml` 的 `crawl:`（workers/shard/rate_limit）与 `images:`（workers/concurrency/interval/max_rounds）段，CLI 无散落默认参数。全站续爬只依赖 `site_meta.last_novel_id`。
+> - **续爬完整性修复（方案 A，2026-08-19）**：`crawl_site` 与 worker 池收尾时重扫「缺章/整本失败」的书（`crawl_novel` 章节差集幂等，只补缺章）；重扫后仍失败的书把续爬起点回退到「最小失败书号 - 1」，防止「爬过但没爬完」的书被计入进度后缺章永久丢失。
+> 正文个别行号/片段为历史快照，可能已偏移；命令与新增能力以 `USAGE.md`、`MULTITHREAD_DESIGN.md`、`IMAGE_CRAWL_DESIGN.md`、`WENKU8_LOGIN_REPORT.md` 为准。
 
 ---
 

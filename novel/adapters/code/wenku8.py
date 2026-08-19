@@ -472,7 +472,7 @@ class Wenku8Adapter(BaseAdapter):
 
     # 连续多少个无效编号后判定已到站点末尾（停止遍历）
     # 尾段空等 ≈ 100 × 5s 限速 ≈ 8 分钟，属可接受代价
-    CONSECUTIVE_SKIP_LIMIT = 100
+    CONSECUTIVE_SKIP_LIMIT = 5
 
     async def iter_all_novels(
         self, filter_params: dict[str, Any] | None = None

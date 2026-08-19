@@ -3,12 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import random
-import time
-from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
 
 from loguru import logger
 
@@ -25,31 +20,12 @@ from novel.core.models import (
     ChapterContent,
     ChapterInfo,
     CrawlResult,
+    ImageRef,
     NovelInfo,
 )
 from novel.core.pipeline import Pipeline, PipelineContext
-from novel.core.paths import COVERS_DIR, IMAGES_DIR
-from novel.utils.text import safe_path_segment
 from novel.core.storage import StorageBackend
 from novel.http.client import AsyncHTTPClient
-
-
-class RateLimiter:
-    """请求限速：间隔 + 随机抖动"""
-
-    def __init__(self, interval: float = 0.1):
-        self._interval = interval
-        self._last_request = 0.0
-        self._lock = asyncio.Lock()
-
-    async def wait(self) -> None:
-        async with self._lock:
-            jitter = random.uniform(0, self._interval * 0.3)
-            wait_time = self._interval + jitter
-            elapsed = time.monotonic() - self._last_request
-            if elapsed < wait_time:
-                await asyncio.sleep(wait_time - elapsed)
-            self._last_request = time.monotonic()
 
 
 class CrawlerEngine:
@@ -69,10 +45,7 @@ class CrawlerEngine:
         pipelines: list[Pipeline] | None = None,
         max_concurrency: int = 8,
         rate_limit: float | None = None,
-        chapter_range: tuple[int, int] | None = None,
         max_retries: int = 3,
-        resume_task_id: str | None = None,
-        image_concurrency: int = 4,
     ):
         self.adapter = adapter
         self.storage = storage
@@ -82,17 +55,14 @@ class CrawlerEngine:
         self.pipelines = pipelines or []
         self.semaphore = asyncio.Semaphore(max_concurrency)
 
-        # 让站点声明的限速真正生效：把 RateLimitMiddleware 的间隔抬高到
-        # 至少 adapter.get_rate_limit()（修复 M1：wenku8 的 5.0s 此前被 3.0s 覆盖）
-        site_rate = adapter.get_rate_limit()
+        # 正文请求限速：取 config 值（crawl.rate_limit）与站点声明（adapter
+        # get_rate_limit）的较大者，把 RateLimitMiddleware 间隔抬高到该值——
+        # 保证配置是主控、站点声明是合规下限（修复 M1：wenku8 的 5.0s 此前
+        # 曾被中间件默认 1.0s 覆盖）。
+        effective_rate = max(adapter.get_rate_limit(), rate_limit or 0)
         for mw in self.request_mw:
             if isinstance(mw, RateLimitMiddleware):
-                mw.ensure_interval_at_least(site_rate)
-
-        # 插图限速：插图走 http_client.fetch_bytes，不经中间件链，单独限速。
-        # 取值优先级：用户 --delay > 站点声明限速（避免被全局默认 3.0s 覆盖）。
-        image_interval = rate_limit if rate_limit is not None else site_rate
-        self.rate_limiter = RateLimiter(image_interval)
+                mw.ensure_interval_at_least(effective_rate)
 
         # 统一中间件抓取器：注入适配器，使其所有 fetch 都经过 UA 轮换 /
         # 限速 / 编码 / 校验 / 重试（修复 H1 双下载 + H2 中间件失效 + M5）。
@@ -110,16 +80,9 @@ class CrawlerEngine:
         )
         adapter.set_fetcher(self.fetcher)
 
-        self.chapter_range = chapter_range
-        self.image_concurrency = max(1, image_concurrency)
         self.max_retries = max_retries
         self._cancelled = False
         self._takedown_detected = False
-        self._resume_task_id = resume_task_id
-        self._task_id: str | None = None
-        from novel.engine.state import TaskManager
-
-        self.task_manager = TaskManager(self.storage)
 
     def cancel(self) -> None:
         """请求停止爬取"""
@@ -136,59 +99,8 @@ class CrawlerEngine:
                 except Exception:  # noqa: BLE001
                     pass
 
-    # ---- 任务状态（断点续爬）----
-
-    async def _ensure_task(self, novel_id: str, site: str, total: int) -> None:
-        """确保存在爬取任务记录。
-
-        - 若指定了 --resume 且任务存在，则复用该任务（状态置为 running）。
-        - 否则创建新任务。
-        已完成的章节由 storage.chapter_exists 在后续流程中自动跳过。
-        """
-        if self._resume_task_id:
-            state = await self.storage.load_state(self._resume_task_id)
-            if state is not None:
-                self._task_id = self._resume_task_id
-                await self.task_manager.update_task(
-                    self._task_id, status="running", total=total
-                )
-                return
-            logger.warning(
-                f"未找到续爬任务 {self._resume_task_id}，将创建新任务"
-            )
-
-        self._task_id = await self.task_manager.create_task(novel_id, site)
-        await self.task_manager.update_task(
-            self._task_id, status="running", total=total
-        )
-
-    async def _update_task(
-        self,
-        status: str | None = None,
-        crawled: int | None = None,
-        failed: list[str] | None = None,
-    ) -> None:
-        """更新任务进度（任务未创建时静默跳过）。"""
-        if self._task_id is None:
-            return
-        await self.task_manager.update_task(
-            self._task_id, status=status, crawled=crawled, failed=failed
-        )
-
-    async def _check_pause(self) -> None:
-        """若任务被标记为 paused，则停止当前爬取。"""
-        if self._cancelled or not self._task_id:
-            return
-        try:
-            state = await self.storage.load_state(self._task_id)
-        except Exception:  # noqa: BLE001
-            return
-        if state and state.get("status") == "paused":
-            self._cancelled = True
-            logger.warning(f"任务 {self._task_id} 已被标记为暂停，停止爬取")
-
     async def crawl_novel(self, novel_id: str) -> CrawlResult:
-        """爬取一本小说的完整流程。"""
+        """爬取一本小说的完整流程（全站爬取的单本内部步骤）。"""
         self._cancelled = False
         self._takedown_detected = False
 
@@ -210,19 +122,11 @@ class CrawlerEngine:
         chapters = await self.adapter.get_chapter_list(novel_id)
         logger.info(f"共 {len(chapters)} 章")
 
-        # 3. 章节范围过滤
-        if self.chapter_range:
-            start, end = self.chapter_range
-            chapters = chapters[start - 1 : end]
-            logger.info(f"章节范围过滤: 第{start}-{end}章，剩余 {len(chapters)} 章")
-
-        # 任务状态记录（支持断点续爬，--resume 复用已有任务）
-        await self._ensure_task(novel_id, self.adapter.site_name, total=len(chapters))
-
-        # 4. 过滤已爬取的章节（单次批量 IN 查询，避免 N+1，修复 M2）
+        # 3. 过滤已爬取的章节（单次批量 IN 查询，避免 N+1，修复 M2；
+        #    限定 novel_id 防跨书章节 ID 撞号误跳，修复 M6）
         chapter_ids = [ch.chapter_id for ch in chapters]
         existing_ids = await self.storage.filter_existing_chapters(
-            chapter_ids, self.adapter.site_name
+            chapter_ids, self.adapter.site_name, novel_internal_id
         )
         pending = [ch for ch in chapters if ch.chapter_id not in existing_ids]
         skipped = [ch.chapter_id for ch in chapters if ch.chapter_id in existing_ids]
@@ -257,36 +161,28 @@ class CrawlerEngine:
                     logger.warning(
                         f"因下架/版权删除，跳过 {takedown_skipped} 章"
                     )
+                # 下架书目写入书籍状态：图片轮询阶段据此跳过该书的图片
+                await self.storage.set_novel_status(
+                    novel_internal_id, "takedown"
+                )
+                logger.warning(
+                    f"书籍状态置为 takedown: {novel_info.title}"
+                )
 
         # 章节写入一次性提交（save_chapter 不再逐条 commit，修复 M3）
         await self.storage.commit()
 
-        # 6. 下载封面
-        try:
-            cover = await self.adapter.get_cover(novel_id)
-            if cover:
-                file_hash = hashlib.sha256(cover).hexdigest()
-                cover_path = str(COVERS_DIR / f"{novel_internal_id}.jpg")
-                COVERS_DIR.mkdir(parents=True, exist_ok=True)
-                Path(cover_path).write_bytes(cover)
-                await self.storage.save_image(
-                    novel_internal_id, None, "cover",
-                    novel_info.cover_url or "", cover_path,
-                    file_hash=file_hash,
-                )
-                logger.info("封面下载完成")
-            # 封面写入提交（save_image 不再逐条 commit，修复 M3）
-            await self.storage.commit()
-        except Exception as e:
-            logger.warning(f"封面下载失败: {e}")
+        # 6. 登记封面（不再即时下载）：与插图同走 images 表 pending，
+        #    由图片轮询阶段统一下载。
+        if novel_info.cover_url:
+            await self.storage.save_images(
+                novel_internal_id, None, "cover",
+                [ImageRef(url=novel_info.cover_url, index=0)],
+            )
+            logger.info("封面已登记（待图片轮询下载）")
 
         logger.info(
             f"爬取完成: 成功 {len(results)} 章, 失败 {len(failed)} 章, 跳过 {len(skipped)} 章"
-        )
-
-        # 更新任务状态为完成
-        await self._update_task(
-            status="completed", crawled=len(results), failed=failed
         )
 
         return CrawlResult(
@@ -307,8 +203,6 @@ class CrawlerEngine:
         抓取失败（重试耗尽 / 被拦截）会抛 FetchError 并向上传播，由 gather 计入
         failed，不会当作正文入库（修复 M5）。
         """
-        # 检查任务是否被外部暂停（如 `tasks pause` 命令）
-        await self._check_pause()
         if self._cancelled:
             logger.info(f"已取消，跳过: {chapter.title}")
             return None
@@ -317,7 +211,6 @@ class CrawlerEngine:
             return None
 
         async with self.semaphore:
-            await self._check_pause()
             if self._cancelled:
                 return None
             if self._takedown_detected:
@@ -356,10 +249,12 @@ class CrawlerEngine:
                         logger.info(f"章节被管道丢弃: {chapter.title}")
                         return None
 
-                # 下载章节插图
+                # 登记章节插图（不再即时下载）：写入 images 表 pending，
+                # 由图片轮询阶段（images crawl）统一下载并回写 HTML
                 if content.images:
-                    content = await self._download_chapter_images(
-                        content, novel_internal_id
+                    await self.storage.save_images(
+                        novel_internal_id, content.chapter_id,
+                        "illustration", content.images,
                     )
 
                 # 存储
@@ -374,7 +269,7 @@ class CrawlerEngine:
                 logger.info(
                     f"已爬取 [{chapter.index}] {chapter.title} "
                     f"({content.word_count} 字"
-                    f"{f', {len(content.images)} 图' if content.images else ''})"
+                    f"{f', 登记 {len(content.images)} 图' if content.images else ''})"
                 )
                 return content
 
@@ -382,96 +277,6 @@ class CrawlerEngine:
                 # 抓取失败 / 解析异常：向上传播，由 crawl_novel 的 gather 计入 failed
                 logger.error(f"章节爬取失败 [{chapter.chapter_id}]: {e}")
                 raise
-
-    async def _download_chapter_images(
-        self, content: ChapterContent, novel_internal_id: str
-    ) -> ChapterContent:
-        """下载章节插图到本地，替换 HTML 中的远程 URL 为本地路径。
-
-        多张插图并发下载（受 image_concurrency 信号量约束），
-        单张图片之间仍受 rate_limiter 限速。
-        """
-        from novel.core.models import ImageRef
-
-        if not content.images:
-            return content
-
-        # 净化 chapter_id 后再用于路径，防路径穿越（修复 M4）。
-        # safe_path_segment 仅保留 [A-Za-z0-9_-]，不含任何路径分隔符，
-        # 故拼接结果必然停留在 IMAGES_DIR/{novel_id}/ 之下。
-        safe_id = safe_path_segment(content.chapter_id)
-        img_dir = IMAGES_DIR / novel_internal_id / safe_id
-        img_dir.mkdir(parents=True, exist_ok=True)
-
-        sem = asyncio.Semaphore(self.image_concurrency)
-
-        async def _download_one(img: ImageRef) -> tuple[ImageRef, str] | None:
-            async with sem:
-                try:
-                    await self.rate_limiter.wait()
-                    img_bytes = await self.http_client.fetch_bytes(img.url)
-                    if not img_bytes:
-                        logger.warning(f"图片下载为空: {img.url}")
-                        return None
-
-                    file_hash = hashlib.sha256(img_bytes).hexdigest()
-                    ext = self._detect_image_ext(img_bytes, img.url)
-                    filename = f"img_{img.index:04d}{ext}"
-                    local_path = str(img_dir / filename)
-                    Path(local_path).write_bytes(img_bytes)
-
-                    epub_path = f"images/{safe_id}/{filename}"
-                    await self.storage.save_image(
-                        novel_internal_id=novel_internal_id,
-                        chapter_internal_id=None,
-                        resource_type="illustration",
-                        remote_url=img.url,
-                        local_path=local_path,
-                        caption=img.caption,
-                        file_hash=file_hash,
-                        image_order=img.index,
-                    )
-                    logger.debug(f"图片已下载: {img.url} -> {local_path}")
-                    return (img, epub_path)
-                except Exception as e:
-                    logger.warning(f"图片下载失败 [{img.url}]: {e}")
-                    return None
-
-        results = await asyncio.gather(
-            *[_download_one(img) for img in content.images]
-        )
-
-        downloaded: list[ImageRef] = []
-        local_paths: dict[str, str] = {}
-        for r in results:
-            if r:
-                img, epub_path = r
-                local_paths[img.url] = epub_path
-                downloaded.append(img)
-
-        if local_paths and content.content:
-            for remote_url, local_url in local_paths.items():
-                content.content = content.content.replace(remote_url, local_url)
-
-        content.images = downloaded
-        return content
-
-    @staticmethod
-    def _detect_image_ext(data: bytes, url: str) -> str:
-        """根据文件头判断图片扩展名。"""
-        if data[:8] == b"\x89PNG\r\n\x1a\n":
-            return ".png"
-        if data[:3] == b"\xff\xd8\xff":
-            return ".jpg"
-        if data[:4] == b"GIF8":
-            return ".gif"
-        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-            return ".webp"
-        # 从 URL 推断
-        for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
-            if ext in url.lower():
-                return ext
-        return ".jpg"
 
     async def crawl_site(
         self,
@@ -524,6 +329,8 @@ class CrawlerEngine:
         logger.info(f"[{site}] 开始全站爬取...")
 
         last_id = 0  # 最后一个有效小说编号，遍历结束后即精确数量
+        # 缺章/整本失败的书：收尾前重扫补缺（方案 A，见下）
+        incomplete: list[tuple[str, str]] = []
         async for novel_info in self.adapter.iter_all_novels(effective_filter):
             if self._cancelled:
                 logger.warning("全站爬取已取消")
@@ -542,6 +349,9 @@ class CrawlerEngine:
             try:
                 result = await self.crawl_novel(novel_info.site_id)
                 results.append(result)
+                if result.failed_chapters:
+                    # 章节级失败：书已计入进度但内容不完整，加入待补清单
+                    incomplete.append((novel_info.site_id, novel_info.title))
             except Exception as e:
                 logger.error(
                     f"全站爬取失败 [{novel_info.site_id} {novel_info.title}]: {e}"
@@ -552,6 +362,33 @@ class CrawlerEngine:
                     failed_chapters=[],
                     skipped_chapters=[],
                 ))
+                incomplete.append((novel_info.site_id, novel_info.title))
+
+        # —— 方案 A：收尾前重扫缺章书（crawl_novel 章节差集幂等，只补缺章）——
+        # 防止「爬过但没爬完的书」被计入进度后，下次续爬不再经过它而缺章永久丢失。
+        still_incomplete: list[tuple[str, str]] = []
+        if incomplete:
+            logger.warning(
+                f"[{site}] {len(incomplete)} 本书缺章/失败，收尾前重扫补缺: "
+                f"{[sid for sid, _ in incomplete]}"
+            )
+            for sid, title in incomplete:
+                try:
+                    r = await self.crawl_novel(sid)
+                    if r.failed_chapters:
+                        still_incomplete.append((sid, title))
+                except Exception as e:  # noqa: BLE001
+                    logger.error(f"重扫仍失败 [{sid} {title}]: {e}")
+                    still_incomplete.append((sid, title))
+            if still_incomplete:
+                # 剔除：续爬起点回退到「仍失败的最小书号 - 1」，
+                # 下次从该书续爬会重新经过它（网络恢复后自动补上）
+                min_failed = min(int(sid) for sid, _ in still_incomplete)
+                last_id = min(last_id, min_failed - 1)
+                logger.warning(
+                    f"[{site}] {len(still_incomplete)} 本书重扫后仍缺章，"
+                    f"续爬起点回退到 {last_id}: {[sid for sid, _ in still_incomplete]}"
+                )
 
         # 遍历结束：保存精确数量（最后一个有内容的有效编号），供下次续爬直接读取
         if last_id and write_last_id:
