@@ -9,7 +9,17 @@ crawl:
   # 全站正文爬取（crawl-all）默认值
   workers: 8            # 线程数（每 worker 独立限速预算 ≈ N× 吞吐）
   shard: true           # 分块领取：500 本一组，块内单本粒度、整空白块判末尾
-  rate_limit: 1.0       # 正文请求间隔（秒）——wenku8 站点限速，勿随意调小
+  rate_limit: 5.0       # 正文请求间隔（秒）——全局默认；sites.<site>.rate_limit 可按站点覆盖
+  block_size: 500       # 分块大小（shard 模式：1-500、501-1000…）
+  blank_limit: 100      # ID 递增遍历「连续空白编号」判定站点末尾的阈值
+  auto_images: true    # 正文爬取结束后自动执行图片轮询（images crawl）——true 则一条命令全搞定
+
+# 站点级覆盖（可选）：rate_limit 优先于 crawl.rate_limit 与适配器声明。
+# 不写死的站点用 crawl.rate_limit，再回退适配器默认值。
+# 例如：wenku8 想单独控制可取消注释并按需调整（调小有被封 IP 风险）。
+#sites:
+#  wenku8:
+#    rate_limit: 5.0
 
 images:
   # 图片独立爬取（images crawl）默认值

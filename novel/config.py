@@ -22,8 +22,11 @@ class CrawlConfig:
     """全站正文爬取（crawl-all）。"""
 
     workers: int = 4          # 默认线程数（每 worker 独立限速预算 ≈ N× 吞吐）
-    shard: bool = True        # 默认分块领取（500 本一组，块内单本粒度）
-    rate_limit: float = 5.0   # 正文请求间隔（秒），wenku8 站点限速
+    shard: bool = True        # 默认分块领取（块内单本粒度）
+    rate_limit: float = 5.0   # 正文请求间隔（秒）——wenku8 站点限速
+    block_size: int = 500     # 分块大小（shard 模式：1-500、501-1000…）
+    blank_limit: int = 100    # ID 递增遍历中「连续空白编号」判定站点末尾的阈值
+    auto_images: bool = False # 正文爬取结束后自动执行图片轮询（images crawl）
 
 
 @dataclass
@@ -94,6 +97,16 @@ class AppConfig:
     # 中间件和管道配置保留为原始 dict，按需读取
     middleware: dict[str, Any] = field(default_factory=dict)
     pipeline: dict[str, Any] = field(default_factory=dict)
+    # 站点级配置：{站点名: {rate_limit: 秒}}。rate_limit 覆盖适配器声明，
+    # 未配置时回退 adapter.get_rate_limit()。
+    sites: dict[str, Any] = field(default_factory=dict)
+
+    def site_rate_limit(self, site: str) -> float | None:
+        """返回站点配置的限速（秒）；未配置返回 None（由调用方回退适配器声明）。"""
+        cfg = self.sites.get(site)
+        if isinstance(cfg, dict) and cfg.get("rate_limit"):
+            return float(cfg["rate_limit"])
+        return None
 
     @classmethod
     def load(cls, yaml_path: str | None = None) -> "AppConfig":

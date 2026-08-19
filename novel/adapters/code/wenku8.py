@@ -470,8 +470,9 @@ class Wenku8Adapter(BaseAdapter):
     # 全站遍历
     # ------------------------------------------------------------------
 
-    # 连续多少个无效编号后判定已到站点末尾（停止遍历）
-    # 尾段空等 ≈ 100 × 5s 限速 ≈ 8 分钟，属可接受代价
+    # 连续多少个无效编号后判定已到站点末尾（停止遍历）。
+    # 仅作兜底默认；引擎/CLI 会从 config `crawl.blank_limit` 读取后经
+    # novel_filter 传入（配置优先，不在此写死）。
     CONSECUTIVE_SKIP_LIMIT = 5
 
     async def iter_all_novels(
@@ -485,7 +486,7 @@ class Wenku8Adapter(BaseAdapter):
         遍历规则（设计要点）：
         - 命中有效小说：yield 并清零连续无效计数；
         - 命中错误页（标题含「出错」「错误」）：跳过并累加连续无效计数，
-          达到 CONSECUTIVE_SKIP_LIMIT 即判定已到站点末尾，结束遍历；
+          达到 blank_limit 即判定已到站点末尾，结束遍历；
         - 网络/解析异常：仅记录并继续，不计入连续无效计数，
           避免站点抖动误判为「到末尾」。
 
@@ -494,15 +495,18 @@ class Wenku8Adapter(BaseAdapter):
 
         Args:
             filter_params:
-                start_id: 起始 ID（默认 1；续爬时由引擎填入，= 已存精确数量 + 1）
-                end_id:   终止 ID（含）；仅内部 ID 分片并行遍历使用，
-                          不通过 CLI 暴露。为 None 时保持「不设上限」语义。
+                start_id:    起始 ID（默认 1；续爬时由引擎填入，= 已存精确数量 + 1）
+                end_id:      终止 ID（含）；仅内部 ID 分片并行遍历使用，
+                             不通过 CLI 暴露。为 None 时保持「不设上限」语义。
+                blank_limit: 连续空白判定末尾的阈值（config `crawl.blank_limit`，
+                             默认 100；未传入时回退类常量兜底）。
         """
         filter_params = filter_params or {}
         novel_id = int(filter_params.get("start_id", 1))
         end_id = filter_params.get("end_id")
         if end_id is not None:
             end_id = int(end_id)
+        blank_limit = int(filter_params.get("blank_limit", self.CONSECUTIVE_SKIP_LIMIT))
         consecutive = 0
 
         if end_id is not None:
@@ -531,7 +535,7 @@ class Wenku8Adapter(BaseAdapter):
 
             if title_tag and ("出错" in title_tag[0] or "错误" in title_tag[0]):
                 consecutive += 1
-                if consecutive >= self.CONSECUTIVE_SKIP_LIMIT:
+                if consecutive >= blank_limit:
                     logger.info(
                         f"wenku8: 连续 {consecutive} 个无效编号，"
                         f"判定已到站点末尾（最后有效 ID={novel_id - consecutive}）"

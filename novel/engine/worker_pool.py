@@ -35,11 +35,10 @@ from loguru import logger
 from novel.config import AppConfig
 
 
-# 分块大小：外层每次领取的 ID 区间长度（如 1-500、501-1000）。
-# 块内按「单本书号」粒度领取（所有 worker 在块内竞争最低空闲书号，单本爬完
-# 立即再领，块内负载均衡）；整块领完再切下一块；**单个整空白块**（块内 0 有效
-# 小说）即判定全局末尾——不再依赖固定上界，原 DEFAULT_SCAN_UPPER=8000 已废弃。
-BLOCK_SIZE = 500
+# 分块大小由 config `crawl.block_size` 控制（默认 500）：外层每次领取的
+# ID 区间长度（如 1-500、501-1000）。块内按「单本书号」粒度领取（所有 worker
+# 在块内竞争最低空闲书号，单本爬完立即再领，块内负载均衡）；整块领完再切下一
+# 块；**单个整空白块**（块内 0 有效小说）即判定全局末尾。
 
 
 class CrawlWorkerPool:
@@ -77,6 +76,8 @@ class CrawlWorkerPool:
         self.max_concurrency = max_concurrency
         self.max_retries = max_retries
         self.mode = mode
+        # 分块大小从 config crawl.block_size 读取（默认 500）
+        self.block_size = max(1, int(config.crawl.block_size))
 
         self.task_q: "queue.Queue[str | None]" = queue.Queue(
             maxsize=max(1, self.workers * 16)
@@ -172,6 +173,7 @@ class CrawlWorkerPool:
             _build_pipelines,
             _get_max_retries,
             maybe_login,
+            resolve_site_rate_limit,
         )
 
         storage = SQLiteBackend(self.db_path)
@@ -204,7 +206,7 @@ class CrawlWorkerPool:
             response_middlewares=resp_mw,
             pipelines=pipelines,
             max_concurrency=self.max_concurrency,
-            rate_limit=self.config.crawl.rate_limit,
+            rate_limit=resolve_site_rate_limit(self.config, self.site, adapter),
             max_retries=self.max_retries or _get_max_retries(self.config),
         )
         return engine, storage, http_client, adapter
@@ -269,7 +271,12 @@ class CrawlWorkerPool:
             start = start_id or 1
             count = 0
             last_id = 0
-            async for novel_info in adapter.iter_all_novels({"start_id": start}):
+            # blank_limit 从 config crawl.blank_limit 读取（连续空白判定末尾阈值）
+            discover_filter = {
+                "start_id": start,
+                "blank_limit": self.config.crawl.blank_limit,
+            }
+            async for novel_info in adapter.iter_all_novels(discover_filter):
                 if self._stop.is_set():
                     break
                 if max_novels and count >= max_novels:
@@ -300,16 +307,17 @@ class CrawlWorkerPool:
     ) -> None:
         """分块领取（模式 B）：块内单本粒度 work-stealing、动态末尾。
 
-        外层：按 BLOCK_SIZE=500 分块（1-500、501-1000…）。所有 worker 在
-        【当前块内】原子领取「序号最低的空闲书号」（单本粒度，块内负载均衡），
-        整块领完后整体切到下一块；**单个整空白块**（块内 0 有效小说）判定全局
-        末尾，由确认 worker 把全局最后有效书号写入 site_meta.last_novel_id
-        （= 网站总书数，供下次续爬）。
+        外层：按 config.crawl.block_size（默认 500）分块（1-N、N+1-2N…）。
+        所有 worker 在【当前块内】原子领取「序号最低的空闲书号」（单本粒度，
+        块内负载均衡），整块领完后整体切到下一块；**单个整空白块**（块内 0 有效
+        小说）判定全局末尾，由确认 worker 把全局最后有效书号写入
+        site_meta.last_novel_id（= 网站总书数，供下次续爬）。
         """
+        bs = self.block_size
         start = start_id or 1
         # 分块共享状态（跨线程，全部由 self._lock 保护）
         self._block_start = start
-        self._block_end = start + BLOCK_SIZE - 1
+        self._block_end = start + bs - 1
         self._next_block_id = start
         self._block_valid = 0
         self._steal_done = False
@@ -317,7 +325,7 @@ class CrawlWorkerPool:
 
         logger.info(
             f"[{self.site}] 分块领取模式：{self.workers} worker，"
-            f"块大小 {BLOCK_SIZE}，起点 {start}，整空白块判定末尾"
+            f"块大小 {bs}，起点 {start}，整空白块判定末尾"
         )
 
         self._threads = []
@@ -367,11 +375,11 @@ class CrawlWorkerPool:
                                 break
                             # 整块领完且有内容 → 切下一块
                             self._block_start = nid
-                            self._block_end = nid + BLOCK_SIZE - 1
+                            self._block_end = nid + self.block_size - 1
                             self._block_valid = 0
                             logger.info(
                                 f"[{self.site}] 进入下一块 "
-                                f"[{nid}, {nid + BLOCK_SIZE - 1}]"
+                                f"[{nid}, {nid + self.block_size - 1}]"
                             )
                             continue
 

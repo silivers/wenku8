@@ -55,11 +55,10 @@ class CrawlerEngine:
         self.pipelines = pipelines or []
         self.semaphore = asyncio.Semaphore(max_concurrency)
 
-        # 正文请求限速：取 config 值（crawl.rate_limit）与站点声明（adapter
-        # get_rate_limit）的较大者，把 RateLimitMiddleware 间隔抬高到该值——
-        # 保证配置是主控、站点声明是合规下限（修复 M1：wenku8 的 5.0s 此前
-        # 曾被中间件默认 1.0s 覆盖）。
-        effective_rate = max(adapter.get_rate_limit(), rate_limit or 0)
+        # 正文请求限速：配置文件优先（sites.<site>.rate_limit > crawl.rate_limit，
+        # 由 CLI 计算后传入），未传入时回退适配器声明（adapter.get_rate_limit()）。
+        # 配置值完全覆盖适配器——「所有配置都在配置文件改」。
+        effective_rate = rate_limit if rate_limit is not None else adapter.get_rate_limit()
         for mw in self.request_mw:
             if isinstance(mw, RateLimitMiddleware):
                 mw.ensure_interval_at_least(effective_rate)

@@ -9,8 +9,9 @@
 ```bash
 pip install -r requirements.txt && pip install -e .
 python -m novel sites list                 # 查看可用站点
-python -m novel crawl-all wenku8           # 全站爬正文（默认 4 线程 + 分块领取，自动续爬）
+python -m novel crawl-all wenku8           # 全站爬正文（默认 8 线程 + 分块领取，自动续爬）
 python -m novel images crawl wenku8        # 图片轮询下载（失败自动重试至全部成功）
+                                          # 或在 config 设 crawl.auto_images: true 一步全搞定
 python -m novel images status wenku8       # 图片下载状态
 python -m novel export <novel-id>          # 导出 EPUB（含已下载插图）
 ```
@@ -25,6 +26,7 @@ python -m novel export <novel-id>          # 导出 EPUB（含已下载插图）
 | [docs/USAGE.md](docs/USAGE.md)                               | 命令行使用指南与 FAQ         |
 | [docs/TECHNICAL\_DESIGN.md](docs/TECHNICAL_DESIGN.md)        | 技术设计（含实现偏差校订）        |
 | [docs/DATABASE\_DESIGN.md](docs/DATABASE_DESIGN.md)          | 数据库设计（表结构/状态机/运维 SQL）  |
+| [docs/CRAWLER\_GUIDE.md](docs/CRAWLER_GUIDE.md)              | 爬虫开发注意事项（踩坑沉淀，通用）      |
 | [docs/MULTITHREAD\_DESIGN.md](docs/MULTITHREAD_DESIGN.md)    | 多线程 worker 池设计       |
 | [docs/IMAGE\_CRAWL\_DESIGN.md](docs/IMAGE_CRAWL_DESIGN.md)   | 图片独立爬取设计（已实现）        |
 | [docs/WENKU8\_LOGIN\_REPORT.md](docs/WENKU8_LOGIN_REPORT.md) | wenku8 登录/分桶/下架/广告修复 |

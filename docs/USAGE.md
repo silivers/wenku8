@@ -3,10 +3,11 @@
 通用轻小说爬虫框架 `novel` 的命令行使用指南。本文档聚焦"怎么用"，架构与扩展方式见 `README.md`。
 
 > **重要前提**：项目只支持全站爬取（单本 `crawl` 命令已移除）。`crawl-all` 与
-> `images crawl` 默认走 **多线程池**（config `crawl.workers` / `images.workers`，默认 4）
+> `images crawl` 默认走 **多线程池**（config `crawl.workers` / `images.workers`）
 > ——每个 worker 在独立 OS 线程 + 独立事件循环内构建私有引擎实例（含独立的
-> `RateLimitMiddleware` 限速预算），≈ N× 吞吐，且每个 worker 仍各自守限速
-> （正文 `crawl.rate_limit` 默认 5s、图片 `images.interval` 默认 1s）。设为 1 即单线程。
+> `RateLimitMiddleware` 限速预算），≈ N× 吞吐，且每个 worker 仍各自守请求间隔限速
+> （正文 `crawl.rate_limit` / `sites.<site>.rate_limit`、图片 `images.interval`）。
+> 线程数设为 1 即单线程。所有默认值见 `config/default.yaml`。
 
 ---
 
@@ -120,7 +121,11 @@ python -m novel search wenku8 "刀剑神域" --page 2
 `config/default.yaml` 的 `crawl:` 段配置。
 
 ```bash
-# 全站爬取正文（默认 4 线程 + 分块领取，ID 递增遍历、自动续爬）
+# 全站爬取正文（线程/分块/限速在 config 调整，ID 递增遍历、自动续爬）
+python -m novel crawl-all wenku8
+
+# config `crawl.auto_images: true` 时，正文爬完自动执行图片轮询（一条命令全搞定）
+# 默认 false——正文与图片两阶段独立，可随时分开跑/重跑
 python -m novel crawl-all wenku8
 
 # 最多爬 50 本 / 从指定 ID 开始（不填则从 site_meta 记录的精确数量 +1 续爬）
@@ -134,14 +139,20 @@ python -m novel crawl-all wenku8 --username "acc@qq.com" --password "pwd"
 python -m novel crawl-all wenku8 --auto-export
 ```
 
-> **多线程与分块（config `crawl:` 段）**：`workers`（默认 4）= 线程数——每个 worker
+> **多线程与分块（config `crawl:` 段）**：`workers`（默认 8）= 线程数——每个 worker
 > 在独立 OS 线程 + 独立事件循环内构建**完整且私有**的引擎（含独立的限速预算），
-> 因此 N 个 worker ≈ N× 吞吐，且每个 worker 仍各自守 `rate_limit`（默认 5s）限速
-> （合规横向扩展）。`shard: true`（默认）启用分块领取：外层按 500 分块
-> （1-500、501-1000…），所有 worker 在当前块内按「序号最低的空闲书号」细粒度领取
+> 因此 N 个 worker ≈ N× 吞吐，且每个 worker 仍各自守请求间隔限速
+> （合规横向扩展）。`shard: true`（默认）启用分块领取：外层按 `block_size`（默认
+> 500）分块，所有 worker 在当前块内按「序号最低的空闲书号」细粒度领取
 > （单本粒度、块内负载均衡），整块领完切下一块；单个整空白块判定全局末尾，
 > 记录最后有效书号 = 网站总书数（不依赖固定上界、不漏爬）。共享的 WAL 数据库
 > 已加 `busy_timeout` + 写重试 + 初始化锁，多线程并发写安全。
+>
+> **请求间隔限速（全部在配置文件改）**：生效值优先级
+> `sites.<site>.rate_limit` > `crawl.rate_limit` > 适配器声明。在
+> `config/default.yaml` 的 `crawl.rate_limit`（全局，默认 1.0s）或 `sites` 段
+> （按站点覆盖，如 `wenku8: {rate_limit: 5.0}`）调整即可，无需改代码。
+> `blank_limit`（默认 100）控制 ID 递增遍历中「连续空白编号」判定站点末尾的阈值。
 >
 > **登录（wenku8 等需登录站点）**：提供 `--username`/`--password`（或环境变量
 > `WENKU8_USERNAME`/`WENKU8_PASSWORD`）后，命令开始时会先调用 `adapter.login()`，
@@ -167,10 +178,13 @@ python -m novel images crawl wenku8
 python -m novel images status wenku8
 ```
 
-> 线程 / 并发 / 间隔 / 轮数由 config `images:` 段控制：`workers`（默认 4，>=2 走
-> 多线程池 ≈ N× 吞吐）、`concurrency`（单本图片并发，默认 4）、`interval`
-> （图片请求间隔秒，默认 1.0——走 CDN，与正文 5s 限速无关）、`max_rounds`
-> （单张图最大尝试轮数，默认 10，超过置 skipped 防死循环）。
+> 线程 / 并发 / 间隔 / 轮数由 config `images:` 段控制：`workers`（>=2 走
+> 多线程池 ≈ N× 吞吐）、`concurrency`（单本图片并发）、`interval`
+> （图片请求间隔秒，走 CDN，与正文限速无关）、`max_rounds`
+> （单张图最大尝试轮数，超过置 skipped 防死循环）。默认值见 `config/default.yaml`。
+>
+> 也可在 `crawl-all` 结束后自动补图：把 config `crawl.auto_images` 设为 `true`，
+> 正文爬完会自动执行图片轮询（等价于手动依次跑两条命令）。
 >
 > 轮询语义：一轮 = 全站所有「有 pending/failed 图片且 book_status='active'」的书
 > 各下载一遍；失败图片 attempt_count+1，参与下一轮；达到 `max_rounds` 仍失败
@@ -239,10 +253,16 @@ A：用了 `python novel ...`。改用 `python -m novel ...`（或先 `pip insta
 
 **Q：单线程还是多线程？并发怎么控制？**
 A：默认多线程——`crawl-all` 与 `images crawl` 的线程数由 config `crawl.workers` /
-`images.workers` 控制（默认 4，>=2 走多线程池；设为 1 即单线程）。N 个 worker 各跑
+`images.workers` 控制（默认 8，>=2 走多线程池；设为 1 即单线程）。N 个 worker 各跑
 独立引擎实例 ≈ N× 吞吐。并发由 `asyncio.Semaphore` 限制（章节 `engine.max_concurrency`、
-图片 `images.concurrency`），频率由 config `crawl.rate_limit`（正文，默认 5s）与
-`images.interval`（图片，默认 1s）控制。每个 worker 仍各自守限速，属合规横向扩展。
+图片 `images.concurrency`），请求间隔由 config 控制：正文 `crawl.rate_limit`
+（或 `sites.<site>.rate_limit`，默认 1.0s）、图片 `images.interval`（默认 1.0s）。
+每个 worker 仍各自守间隔限速，属合规横向扩展。
+
+**Q：想改快/改慢请求频率怎么办？**
+A：改 `config/default.yaml`：`crawl.rate_limit` 是正文全局间隔，`sites.<site>.rate_limit`
+可按站点覆盖，`images.interval` 是图片间隔。配置优先于适配器声明，改配置即可生效
+（`python -m novel sites list` 会显示生效值）。调小有被封 IP 的风险，自行权衡。
 
 **Q：图片下载失败会重试吗？**
 A：会。正文与图片已解耦：失败图片在 images 表标记 failed（attempt_count+1），

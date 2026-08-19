@@ -1,6 +1,10 @@
 # 项目长期记忆（MEMORY.md）
 
 ## 工程状态（2026-08-19）
+- **v3.2b 配置化**：所有运行参数入 `config/default.yaml`，不写死——
+  `sites.<site>.rate_limit`（按站点覆盖）> `crawl.rate_limit` > 适配器声明；
+  `crawl.block_size`（分块）、`crawl.blank_limit`（连续空白判末尾）也入配置。
+  引擎限速**配置完全覆盖适配器**（用户改 config 即生效，`sites list` 显示生效值）。
 - **v3.2 已精简**：只支持全站爬取（`crawl` 单本命令与 `tasks` 命令组已删；
   任务状态机 TaskManager/crawl_states 读写已删，续爬只靠 `site_meta.last_novel_id`）。
 - **续爬完整性（方案 A 已落地）**：`crawl_site`/worker 池收尾前重扫缺章书

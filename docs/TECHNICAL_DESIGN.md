@@ -15,6 +15,7 @@
 > - **图片独立爬取（v3.1）**：正文与图片彻底解耦——`crawl-all` 只爬正文并把图片登记到新 `images` 表（pending），插图/封面由 `images crawl` 轮询下载（失败图下一轮重试直至全部成功，`images.max_rounds` 兜底置 skipped；下架书经 `novels.book_status` 跳过）。`resources` 表与 `chapters.images` 列已在 004 迁移中退役。图片链路的权威说明见 `IMAGE_CRAWL_DESIGN.md`（已实现）；本文 §7 / §9 的 resources/save_image 描述为历史快照。
 > - **精简（v3.2）**：移除单本爬取（`crawl` 命令与 `--resume`/`--chapters`）、任务状态机（`tasks` 命令、`crawl_states` 读写、`engine/state.py` 已删）；限速 / 线程 / 并发等默认值全部集中到 `config/default.yaml` 的 `crawl:`（workers/shard/rate_limit）与 `images:`（workers/concurrency/interval/max_rounds）段，CLI 无散落默认参数。全站续爬只依赖 `site_meta.last_novel_id`。
 > - **续爬完整性修复（方案 A，2026-08-19）**：`crawl_site` 与 worker 池收尾时重扫「缺章/整本失败」的书（`crawl_novel` 章节差集幂等，只补缺章）；重扫后仍失败的书把续爬起点回退到「最小失败书号 - 1」，防止「爬过但没爬完」的书被计入进度后缺章永久丢失。
+> - **配置化（v3.2，2026-08-19）**：所有运行参数不再写死——站点限速在 `config/default.yaml` 的 `sites.<site>.rate_limit`（覆盖适配器声明，未配置回退 `crawl.rate_limit` 再回退适配器）；分块大小 `crawl.block_size`、连续空白判定末尾阈值 `crawl.blank_limit`（适配器 `iter_all_novels` 经 novel_filter 读取）均入配置；`sites list`/`config show` 显示生效值。`crawl.auto_images: true` 时 `crawl-all` 正文爬完自动执行图片轮询（一步全搞定）。
 > 正文个别行号/片段为历史快照，可能已偏移；命令与新增能力以 `USAGE.md`、`MULTITHREAD_DESIGN.md`、`IMAGE_CRAWL_DESIGN.md`、`WENKU8_LOGIN_REPORT.md` 为准。
 
 ---

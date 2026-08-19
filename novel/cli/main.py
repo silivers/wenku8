@@ -192,6 +192,19 @@ def resolve_credentials(cli_username: str | None, cli_password: str | None):
     return username, password
 
 
+def resolve_site_rate_limit(config: "AppConfig", site: str, adapter) -> float:
+    """站点生效的正文限速（秒）。
+
+    优先级：config `sites.<site>.rate_limit` > config `crawl.rate_limit` >
+    适配器声明 `adapter.get_rate_limit()`。所有配置都在配置文件改。
+    """
+    return (
+        config.site_rate_limit(site)
+        or config.crawl.rate_limit
+        or adapter.get_rate_limit()
+    )
+
+
 async def maybe_login(adapter, username: str | None, password: str | None) -> bool:
     """若提供了凭据且适配器支持登录，则执行登录。
 
@@ -258,7 +271,8 @@ def sites_list(ctx):
         click.echo("可用站点:")
         for site in sites_list_data:
             adapter = registry.get(site)
-            click.echo(f"  {site:15s}  {adapter.base_url}  (限速: {adapter.get_rate_limit()}s)")
+            rate = resolve_site_rate_limit(config, site, adapter)
+            click.echo(f"  {site:15s}  {adapter.base_url}  (限速: {rate}s)")
 
 
 @sites.command("info")
@@ -279,7 +293,7 @@ def sites_info(ctx, site_name):
         "site_name": adapter.site_name,
         "base_url": adapter.base_url,
         "encoding": adapter.encoding,
-        "rate_limit": adapter.get_rate_limit(),
+        "rate_limit": resolve_site_rate_limit(config, site_name, adapter),
     }
 
     if ctx.obj["json"]:
@@ -414,6 +428,8 @@ def crawl_all(ctx, site_name, max_novels, start_id, auto_export, username, passw
     filter_params = {}
     if start_id is not None:
         filter_params["start_id"] = start_id
+    # 连续空白判定末尾的阈值（config crawl.blank_limit，透传给适配器 iter_all_novels）
+    filter_params["blank_limit"] = config.crawl.blank_limit
 
     async def _crawl_all():
         # 轻量能力探测（不创建完整引擎链路）
@@ -461,6 +477,19 @@ def crawl_all(ctx, site_name, max_novels, start_id, auto_export, username, passw
 
             if auto_export:
                 await _export_site(config, site_name)
+
+            # auto_images=true：正文结束后自动补图（一条命令全搞定）
+            if config.crawl.auto_images:
+                click.echo("\nauto_images=true，自动开始图片轮询爬取...")
+                try:
+                    report = await _run_image_crawl(config, site_name)
+                    click.echo(
+                        f"图片爬取完成: 成功 {report.images_ok} 张, "
+                        f"失败 {report.images_failed} 张, 剩余 {report.remaining} 张"
+                    )
+                except Exception as e:
+                    logger.error(f"自动图片爬取失败: {e}")
+                    click.echo(f"错误: {e}", err=True)
             return
 
         # ---- 单线程模式（workers == 1，原有路径）----
@@ -485,7 +514,7 @@ def crawl_all(ctx, site_name, max_novels, start_id, auto_export, username, passw
                 response_middlewares=resp_mw,
                 pipelines=pipelines,
                 max_concurrency=config.engine.max_concurrency,
-                rate_limit=config.crawl.rate_limit,
+                rate_limit=resolve_site_rate_limit(config, site_name, adapter),
                 max_retries=_get_max_retries(config),
             )
 
@@ -535,6 +564,19 @@ def crawl_all(ctx, site_name, max_novels, start_id, auto_export, username, passw
                                 break
                     except Exception as e:
                         logger.warning(f"导出失败 [{r.novel.title}]: {e}")
+
+            # auto_images=true：正文结束后自动补图（一条命令全搞定）
+            if config.crawl.auto_images:
+                click.echo("\nauto_images=true，自动开始图片轮询爬取...")
+                try:
+                    report = await _run_image_crawl(config, site_name)
+                    click.echo(
+                        f"图片爬取完成: 成功 {report.images_ok} 张, "
+                        f"失败 {report.images_failed} 张, 剩余 {report.remaining} 张"
+                    )
+                except Exception as e:
+                    logger.error(f"自动图片爬取失败: {e}")
+                    click.echo(f"错误: {e}", err=True)
 
             await engine.aclose()
             await adapter.close()
@@ -586,6 +628,40 @@ def images():
     """图片爬取管理（与正文爬取解耦的独立阶段）"""
 
 
+async def _run_image_crawl(config: "AppConfig", site_name: str):
+    """执行图片轮询爬取（自建组件；正文与图片解耦，可独立/串联调用）。
+
+    线程/并发/间隔/轮数从 config `images:` 段读取；返回 ImageCrawlReport。
+    """
+    from novel.engine.image_crawler import ImageCrawler, ImageWorkerPool
+
+    storage, http_client, _, _, _, _ = create_engine_from_config(config)
+    await storage.init()
+    try:
+        if config.images.workers >= 2:
+            pool = ImageWorkerPool(
+                config=config,
+                site=site_name,
+                db_path=config.storage.sqlite.path,
+                workers=config.images.workers,
+                image_concurrency=config.images.concurrency,
+                interval=config.images.interval,
+                max_rounds=config.images.max_rounds,
+            )
+            return await pool.arun()
+        crawler = ImageCrawler(
+            storage=storage,
+            http_client=http_client,
+            image_concurrency=config.images.concurrency,
+            interval=config.images.interval,
+            max_rounds=config.images.max_rounds,
+        )
+        return await crawler.run(site_name)
+    finally:
+        await http_client.close()
+        await storage.close()
+
+
 @images.command("crawl")
 @click.argument("site_name")
 @click.pass_context
@@ -598,37 +674,10 @@ def images_crawl(ctx, site_name):
     书目的图片自动跳过。
     """
     config = ctx.obj["config"]
-    workers = config.images.workers
-    image_concurrency = config.images.concurrency
-    delay = config.images.interval
-    max_rounds = config.images.max_rounds
 
     async def _crawl():
-        storage, http_client, _, _, _, _ = create_engine_from_config(config)
-        await storage.init()
         try:
-            from novel.engine.image_crawler import ImageCrawler, ImageWorkerPool
-
-            if workers >= 2:
-                pool = ImageWorkerPool(
-                    config=config,
-                    site=site_name,
-                    db_path=config.storage.sqlite.path,
-                    workers=workers,
-                    image_concurrency=image_concurrency,
-                    interval=delay,
-                    max_rounds=max_rounds,
-                )
-                report = await pool.arun()
-            else:
-                crawler = ImageCrawler(
-                    storage=storage,
-                    http_client=http_client,
-                    image_concurrency=image_concurrency,
-                    interval=delay,
-                    max_rounds=max_rounds,
-                )
-                report = await crawler.run(site_name)
+            report = await _run_image_crawl(config, site_name)
 
             click.echo(f"\n图片爬取完成:")
             click.echo(f"  轮数:     {report.rounds}")
@@ -643,9 +692,6 @@ def images_crawl(ctx, site_name):
             logger.error(f"图片爬取失败: {e}")
             click.echo(f"错误: {e}", err=True)
             sys.exit(1)
-        finally:
-            await http_client.close()
-            await storage.close()
 
     run_async(_crawl())
 
@@ -738,7 +784,7 @@ def update(ctx, site_name, username, password):
                         response_middlewares=resp_mw,
                         pipelines=pipelines,
                         max_concurrency=config.engine.max_concurrency,
-                        rate_limit=config.crawl.rate_limit,
+                        rate_limit=resolve_site_rate_limit(config, site, adapter),
                         max_retries=_get_max_retries(config),
                     )
                     await engine.crawl_novel(site_novel_id)
@@ -968,8 +1014,10 @@ def config_show(ctx):
     click.echo(f"存储后端:   {config.storage.backend}")
     click.echo(f"数据库路径: {config.storage.sqlite.path}")
     click.echo(f"章节并发:   {config.engine.max_concurrency}")
-    click.echo(f"爬取线程:   {config.crawl.workers} (shard={config.crawl.shard})")
-    click.echo(f"正文限速:   {config.crawl.rate_limit}s")
+    click.echo(f"爬取线程:   {config.crawl.workers} (shard={config.crawl.shard}, 分块={config.crawl.block_size}, auto_images={config.crawl.auto_images})")
+    click.echo(f"正文限速:   {config.crawl.rate_limit}s (blank_limit={config.crawl.blank_limit})")
+    site_cfg = {k: v for k, v in config.sites.items() if isinstance(v, dict) and v.get("rate_limit")}
+    click.echo(f"站点限速:   {site_cfg if site_cfg else '（未配置，走 crawl.rate_limit）'}")
     click.echo(f"图片线程:   {config.images.workers} (并发 {config.images.concurrency}, 间隔 {config.images.interval}s, 轮数 {config.images.max_rounds})")
     click.echo(f"输出目录:   {config.export.output_dir}")
     click.echo(f"日志级别:   {config.logging.level}")
