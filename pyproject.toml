@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "novel-crawler"
+version = "1.0.0"
+description = "通用轻小说爬虫框架 — 适配器模式 + 中间件管道 + 异步引擎"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "novel-crawler" }]
+# Dependencies are managed in requirements.txt
+
+[project.scripts]
+novel = "novel.cli.main:cli"
+
+[tool.setuptools.packages.find]
+include = ["novel*"]
+
+[tool.setuptools.package-data]
+"novel" = ["exporters/templates/**/*", "storage/migrations/*.sql"]

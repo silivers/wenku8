@@ -1,0 +1,45 @@
+# 示例：YAML 配置适配器
+# 复制此文件并修改为你的站点配置，放入此目录即可自动加载
+# 适合结构简单的静态 HTML 站点
+
+site_name: "example"
+base_url: "https://www.example.com"
+encoding: "utf-8"   # 站点编码，不确定则用 "auto"
+rate_limit: 3.0     # 请求间隔（秒）
+
+search:
+  url_template: "/search?q={keyword}&page={page}"
+  items_selector: "//div[@class='result-item']"
+  fields:
+    title: ".//h3/a/text()"
+    author: ".//span[@class='author']/text()"
+    novel_id: ".//h3/a/@href"
+    novel_id_regex: "/book/(\\d+)"
+
+novel_info:
+  url_template: "/book/{novel_id}"
+  fields:
+    title: "//h1[@class='title']/text()"
+    author: "//a[@class='author']/text()"
+    description: "//div[@class='description']/text()"
+    cover_url: "//img[@class='cover']/@src"
+    status: "//span[@class='status']/text()"
+  status_mapping:
+    "连载中": "ongoing"
+    "完结": "completed"
+
+chapter_list:
+  selector: "//div[@id='chapter-list']//a"
+  fields:
+    title: "./text()"
+    url: "./@href"
+    chapter_id_regex: "/chapter/(\\d+)"
+
+chapter_content:
+  selector: "//div[@id='content']"
+  remove_selectors:
+    - "//div[@class='ad']"
+    - "//script"
+    - "//style"
+  image_selector: "//img/@src"
+  title_selector: "//h1[@class='chapter-title']/text()"

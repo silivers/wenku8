@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual env
+.venv/
+venv/
+
+# Data & DB（爬取数据 + SQLite 库及 WAL 附属文件兜底）
+data/
+output/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# 根目录临时脚本（测试/诊断用，如 _xxx_test.py）
+/_*.py
+
+# Logs
+logs/
+*.log
+
+# Secrets / env（登录凭据可能放环境变量文件）
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test / cache
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/

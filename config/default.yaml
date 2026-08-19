@@ -1,0 +1,62 @@
+# novel.yaml — 通用轻小说爬虫框架配置文件
+# 复制到项目根目录或用 --config 指定路径
+
+engine:
+  max_concurrency: 5
+  default_rate_limit: 3.0
+
+http:
+  timeout_connect: 10
+  timeout_read: 30
+  follow_redirects: true
+  # 全局代理（也可由环境变量 NOVEL_PROXY 设置）：http://127.0.0.1:7890
+  proxy: null
+
+storage:
+  backend: "sqlite"
+  sqlite:
+    path: "data/novels.db"
+
+middleware:
+  request:
+    - user_agent:
+        rotate: true
+    - rate_limit:
+        interval: 3.0
+        jitter: 0.3
+  response:
+    - encoding:
+        fallback: "utf-8"
+    - content_verify:
+        honeypot_patterns:
+          - "请刷新页面重试"
+          - "检测到异常访问"
+    - retry:
+        max_retries: 3
+        backoff_base: 1.0
+        retry_status_codes: [429, 500, 502, 503, 504]
+
+pipeline:
+  html_cleaner:
+    enabled: true
+  text_normalizer:
+    enabled: true
+    normalize_width: false
+  deduplication:
+    enabled: true
+  quality_validator:
+    enabled: true
+
+export:
+  output_dir: "./output"
+  epub:
+    style: "default"
+    split_by_volume: true
+    font_family: "Georgia, Noto Serif SC"
+    base_font_size: "14pt"
+    line_height: 1.8
+    paragraph_indent: "2em"
+
+logging:
+  level: "info"
+  file: "logs/novel.log"

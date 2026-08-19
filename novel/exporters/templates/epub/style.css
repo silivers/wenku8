@@ -1,0 +1,93 @@
+/* EPUB 默认样式表 */
+
+@charset "utf-8";
+
+body {
+    margin: 0;
+    padding: 1em 0;
+    font-family: Georgia, "Noto Serif SC", "Source Han Serif SC", serif;
+    font-size: 14pt;
+    line-height: 1.8;
+    color: #1a1a1a;
+    background: #fefefe;
+}
+
+/* 书籍主标题 */
+.book-title {
+    font-size: 2.2em;
+    line-height: 1.4;
+    text-align: center;
+    margin: 3em 0 0.5em 0;
+    font-weight: bold;
+}
+
+.book-author {
+    font-size: 1.2em;
+    text-align: center;
+    margin: 0 0 4em 0;
+    color: #555;
+}
+
+/* 卷标题 */
+.volume-title {
+    font-size: 1.8em;
+    line-height: 1.6;
+    text-align: center;
+    margin: 3em 0 2em 0;
+    page-break-before: always;
+    font-weight: bold;
+}
+
+/* 章节标题 */
+.chapter-title {
+    font-size: 1.5em;
+    line-height: 1.6;
+    text-align: center;
+    margin: 2em 0 1.5em 0;
+    page-break-before: always;
+    font-weight: bold;
+}
+
+/* 正文段落 */
+p {
+    text-indent: 2em;
+    margin: 0;
+    padding: 0;
+    text-align: justify;
+}
+
+/* 作者后记 */
+.author-note {
+    page-break-before: always;
+    margin-top: 3em;
+    padding: 1em;
+    border-top: 1px solid #ccc;
+    font-size: 0.9em;
+    color: #444;
+}
+
+.author-note-title {
+    font-size: 1.2em;
+    text-align: center;
+    margin-bottom: 1em;
+    font-weight: bold;
+}
+
+/* 插图 */
+.illustration {
+    text-align: center;
+    margin: 1.5em 0;
+    page-break-inside: avoid;
+}
+
+.illustration img {
+    max-width: 100%;
+    height: auto;
+}
+
+.illustration .caption {
+    font-size: 0.85em;
+    color: #666;
+    margin-top: 0.5em;
+    text-indent: 0;
+}
